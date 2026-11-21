@@ -320,6 +320,24 @@ void lazy_poll() {
 
 // IK2_PROF=1: the stream waited for at each phase's end, its time added to the phase (slower, but where it goes)
 bool g_prof = false;
+// IK2_PROF2=1 (temporary): the attention phase's sections per visit, GPU events drained after each token
+bool g_prof2 = false;
+cudaEvent_t g_p2ev[9][64];
+double g_p2acc[8];
+double g_p2_tokens = 0;
+int g_p2_vis = 0;
+inline void p2(int vis, int slot) {
+    if (g_prof2) cudaEventRecord(g_p2ev[slot][vis], g_s);
+}
+const char* const g_p2name[8] = {"gates/msg", "res+rms", "proj(qkv+sink)", "kv convs",
+                                 "prep_qkv", "attn kernel", "gate+o+conv", "moe_in"};
+// The EP block's limb (dp4a) kernels for a pick's gate | up | down: 4.2x the row kernels at the same shapes on gfx906
+// (24.0 vs 35.2 ms a token measured).  CUDA keeps the row kernels it has run (its limb path is the resident one).
+#if defined(STRATA_USE_HIP)
+constexpr bool g_ep_limb = true;
+#else
+constexpr bool g_ep_limb = false;
+#endif
 bool g_mv = true;   // IK2_MV=0: a few tokens' experts through the FP16 GEMMs too
 // How often each expert is picked by a token (prefill and decode), [n_layer * E]: IK2_POP_OUT=FILE writes it at
 // the end (int32 n_layer, int32 E, then uint64 counts); IK2_WARM=FILE fills the expert cache with the most picked
@@ -388,6 +406,15 @@ T* dalloc(size_t n) {
 
 // Y [T][N] (ldy) = X [T][K] FP16 . W [N][K]^T FP16, F32 sums
 void gemm16(const uint16_t* W, int N, int Kd, const uint16_t* X, int T, float* Y, int ldy, float beta = 0.0f) {
+#if defined(STRATA_USE_HIP)
+    // A token's dense products are GEMVs: hipBLAS' GEMM with T = 1 reads the same weights at ~183 GB/s on gfx906, a
+    // warp-a-row kernel with 16-byte loads at ~840 (measured), and the dense weights are most of a token's time.  The
+    // products' order differs from hipBLAS' (a lane's strided sum), the same on every GPU of a run.
+    if (T == 1 && beta == 0.0f && Kd % 8 == 0 && (((uintptr_t) W | (uintptr_t) X) & 15) == 0) {
+        k::mv_f16_token(W, N, Kd, X, Y, g_s);
+        return;
+    }
+#endif
     const float one = 1.0f;
     CB(cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, N, T, Kd, &one, W, CUDA_R_16F, Kd, X, CUDA_R_16F, Kd, &beta, Y,
                     CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
@@ -1478,6 +1505,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         in_q = W.xq, in_k = W.xk, in_v = W.xv;
         xk16 = W.xk16, xv16 = W.xv16;
     }
+    p2(g_p2_vis, 2);
     const int HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel;
     float *q_p = W.q, *k_p = W.kk, *v_p = W.vv, *r_p = W.rr, *gate_p = W.gate, *sink_p = W.sink;
     float *kd_p = W.dyn, *vd_p = W.dyn;
@@ -1516,10 +1544,11 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             matmul(Ly.wgate, in_q, W.x16, T, gate_p, HD);
             gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
         }
+        p2(g_p2_vis, 3);
         conv_rec(Ly, 0, k_p, Ly.h_k, T, KD);
         conv_rec(Ly, 1, v_p, Ly.h_v, T, KD);
-        k::conv4(k_p, Ly.h_k, Ly.sc_k, nullptr, 0, T, KD, W.kconv, g_s);
-        k::conv4(v_p, Ly.h_v, Ly.sc_v, nullptr, 0, T, KD, W.vconv, g_s);
+        k::conv4_pair(k_p, Ly.h_k, Ly.sc_k, W.kconv, v_p, Ly.h_v, Ly.sc_v, W.vconv, T, KD, g_s);
+        p2(g_p2_vis, 4);
     } else {
         if (Ly.wqrg.N > 0) {
             matmul(Ly.wqrg, in_q, W.x16, T, W.qkv, Ly.wqrg.N);
@@ -1542,6 +1571,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             matmul(Ly.wgate, in_q, W.x16, T, gate_p, HD);
             gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
         }
+        p2(g_p2_vis, 3);
         if (!g_dense_q8) {
             const int off_k = T == 1 ? Ly.wqrg.N : 0;
             const int off_v = T == 1 ? Ly.wqrg.N + Ly.wk_dyn.N : 0;
@@ -1575,6 +1605,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             conv_rec(Ly, 1, v_p, Ly.h_v, T, KD);
             k::conv4(v_p, Ly.h_v, Ly.sc_v, vd_p, c.KV, T, KD, W.vconv, g_s);
         }
+        p2(g_p2_vis, 4);
     }
     const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f;
     const float v_scale = 32.0f;
@@ -1596,6 +1627,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                           Ly.kv_cap, g_s);
     }
 
+    p2(g_p2_vis, 5);
     const int extent = Ly.sliding ? c.extent_swa : c.extent;
     const int window = Ly.sliding ? c.window : (1 << 30);
     const int k0 = Ly.sliding ? std::max(0, pos0 - c.window + 1) : 0;
@@ -1603,14 +1635,17 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const float one = 1.0f, zero = 0.0f;
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
     const int attn_kv_cap = Ly.sliding ? Ly.kv_cap : 0;
+    bool gated_in_combine = false;
     if (T == 1) {
         if (g_kv_fp8) {
             k::attn_decode_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0,
-                               qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+                               qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s, gate_p,
+                               W.x16);
         } else {
             k::attn_decode_f16(q_p, r_p, sink_p, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0, qk_scale,
-                               Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+                               Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s, gate_p, W.x16);
         }
+        gated_in_combine = true;   // (the gate and the FP16 copy are the combine's now)
     } else if (T <= 8 && g_group && g_group_attn) {
         if (g_kv_fp8) {
             k::attn_multi_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, T, c.H, c.KV, k0, nk, pos0,
@@ -1736,7 +1771,8 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             ts += Tq;
         }
     }
-    k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && T == 1, g_s);
+    p2(g_p2_vis, 6);
+    if (!gated_in_combine) k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && T == 1, g_s);
     matmul(Ly.wo, W.o, W.x16, T, W.tmp, C);
     conv_rec(Ly, 2, W.tmp, Ly.h_attn, T, C);
     if (l % c.block == 0) {
@@ -1745,6 +1781,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     } else {
         k::conv4_res(W.tmp, Ly.h_attn, Ly.sc_attn, nullptr, 0, T, C, h_in, r_out, g_s);
     }
+    p2(g_p2_vis, 7);
 }
 
 // A layer-major prefill pass of many tokens uses nearly every expert of a layer, so the ones not in VRAM can be
@@ -2432,7 +2469,13 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             C % 64 == 0 && (((limb & 1) && Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4) || ((limb & 4) && q8_gate));
         const bool fast_down =
             c.F % 64 == 0 && (((limb & 2) && Ly.ty[2] == k::kNVFP4) || ((limb & 8) && Ly.ty[2] == k::kQ8_0));
+#if defined(STRATA_USE_HIP)
+        // (the experts' tensor-core kernel is mma.sync's; the scalar rows and the limb (dp4a) path run instead)
+        static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 0;
+        if (exp_mma) die("IK2_EXPERT_MMA=1: the experts' tensor-core kernel is not built for HIP/gfx906");
+#else
         static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
+#endif
         const bool exp_tc = exp_mma && !fast_gate && !fast_down && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
         k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
                        Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
@@ -3068,6 +3111,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             ECp = &dev_cache(g_cur);
         }
         g_pf.start();
+        p2(vis, 0);
         // A looped core.  Its first pass: the stream it is given is kept.  A later pass starts again from that stream
         // and the blocks before the core, and reads the pass before through messages: that pass's bank is the blocks
         // it added after its first (the first is the kept stream) and its final stream.
@@ -3101,6 +3145,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             if (tap >= 0)
                 CU(cudaMemcpyAsync(g_taps + (size_t) tap * g_taps_ld * C, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
         }
+        p2(vis, 1);
+        g_p2_vis = vis;
         run_layer_attn(M, Ly, l, T, pos0, W.h, W.pos, nb, 0, W.r, W, msg);
         dump_f("blk." + std::to_string(vis) + ".attn_out", W.r, TC);
         if (l % c.block == 0) ++nb;
@@ -3122,6 +3168,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 k::attn_res_rms_f16(st, nb + 1, Ly.ffn_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
             }
         }
+        p2(vis, 8);
         g_pf.lap(g_pf.attn);
         gemm16(Ly.router16, c.E, C, W.x16, T, W.rlog, c.E);
         const int S = T * c.K;
@@ -3255,6 +3302,11 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         if (g_ep && T == 1 && g_overlap && !g_prof) {
             const double te0 = now();
             const int F = c.F;
+            // The limb (dp4a) kernels for a pick's gate | up | down when its types are the ones they take: NVFP4 whole,
+            // or Q8_0 whole (the input rows go in as two 8-bit limbs, 15 bits of the F32 input); else the row kernels.
+            const bool q8_limb = Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0 && Ly.ty[2] == k::kQ8_0;
+            const bool nv_limb = Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4;
+            const bool limb = g_ep_limb && (nv_limb || q8_limb) && C % 64 == 0 && F % 64 == 0;
             int row_of[16], n_d[2] = {0, 0};
             const uint8_t* blob_d[2][16];
             float sg_d[2][16], su_d[2][16];
@@ -3307,10 +3359,18 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     const int p0 = part ? nhit : 0, m = part ? nmis : nhit;
                     if (part) CU(cudaStreamWaitEvent(g_s, g_ep_cp[d], 0));
                     if (!m) continue;
-                    k::experts_gate_up_swiglu(pb + p0, ptk + p0, m, Ly.ty[0], Ly.ty[1], Ly.eb[0], Wd.xq, C, F, psg + p0,
-                                              psu + p0, c.gate_cap, c.up_cap, Wd.h16 + (size_t) p0 * F, g_s);
-                    k::experts_down(pb + p0, m, Ly.ty[2], Ly.eb[0] + Ly.eb[1], Wd.h16 + (size_t) p0 * F, C, F,
-                                    Wd.y32 + (size_t) p0 * C, g_s);
+                    if (limb) {   // (the limb (dp4a) kernels: the input as two 8-bit limbs, one launch a phase)
+                        k::expert_limb_mv(true, pb + p0, Ly.eb[0], C, F, m, Wd.xq, Wd.h16 + (size_t) p0 * F, nullptr,
+                                          psg + p0, psu + p0, c.gate_cap, c.up_cap, Wd.gu32, g_s, q8_limb, false);
+                        k::expert_limb_mv(false, pb + p0, Ly.eb[0] + Ly.eb[1], C, F, m, Wd.xq,
+                                          Wd.h16 + (size_t) p0 * F, Wd.y32 + (size_t) p0 * C, nullptr, nullptr, 0.0f,
+                                          0.0f, Wd.gu32, g_s, q8_limb, false);
+                    } else {
+                        k::experts_gate_up_swiglu(pb + p0, ptk + p0, m, Ly.ty[0], Ly.ty[1], Ly.eb[0], Wd.xq, C, F,
+                                                  psg + p0, psu + p0, c.gate_cap, c.up_cap, Wd.h16 + (size_t) p0 * F, g_s);
+                        k::experts_down(pb + p0, m, Ly.ty[2], Ly.eb[0] + Ly.eb[1], Wd.h16 + (size_t) p0 * F, C, F,
+                                        Wd.y32 + (size_t) p0 * C, g_s);
+                    }
                 }
                 if (d == 1) {
                     CU(cudaMemcpyPeerAsync(dev_work(0).y32 + (size_t) 8 * C, 0, Wd.y32, 1, (size_t) n * C * 4, g_s));
@@ -3596,6 +3656,16 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         run_prefill_moe(M, Ly, l, T, W.x16, top, w, W.r, W.h, W, EC, t_exp);
         g_pf.lap(g_pf.rest);
         dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
+    }
+    if (g_prof2 && T == 1) {   // (temporary: IK2_PROF2, the visits' attention sections)
+        CU(cudaStreamSynchronize(g_dev[0].s));
+        for (int v = 0; v < c.n_visit; ++v)
+            for (int slot = 0; slot < 8; ++slot) {
+                float ms = 0.0f;
+                CU(cudaEventElapsedTime(&ms, g_p2ev[slot][v], g_p2ev[slot + 1][v]));
+                g_p2acc[slot] += ms;
+            }
+        g_p2_tokens += 1;
     }
     run_head(M, T, all_logits, out_mode, nb, W.h, W, logits_out, argmax_out);
 #undef W
@@ -4122,7 +4192,16 @@ int main(int argc, char** argv) {
         else die("unknown argument " + a);
     }
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
+    g_prof2 = getenv("IK2_PROF2") && std::atoi(getenv("IK2_PROF2"));
+#if defined(STRATA_USE_HIP)
+    // The fused prefill attention is mma.sync m16n8k16 (and Hopper's wgmma): no HIP kernel builds it, so the scalar
+    // split kernels of attn_decode_f16_at are the path.  Asking for the fused one is refused rather than silently run.
+    if (getenv("IK2_FLASH") && std::atoi(getenv("IK2_FLASH")))
+        die("IK2_FLASH=1: the fused attention is a tensor-core kernel, not built for HIP/gfx906 (the scalar kernels run)");
+    g_flash = false;
+#else
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
+#endif
     g_mv = !getenv("IK2_MV") || std::atoi(getenv("IK2_MV"));
     g_group = !getenv("IK2_GROUP") || std::atoi(getenv("IK2_GROUP"));
     if (getenv("IK2_GROUP")) {
@@ -4204,6 +4283,10 @@ int main(int argc, char** argv) {
     const int n_sliding = (int) std::count(c.sliding.begin(), c.sliding.end(), true);
     std::printf("maya-ik2: %d layers (%d sliding), %d experts (%d a token), width %d, vocab %d; %zu shards\n",
                 c.n_layer, n_sliding, c.E, c.K, c.C, c.n_vocab, S.files.size());
+#if defined(STRATA_USE_HIP)
+    std::printf("maya-ik2: HIP/gfx906: no tensor-core (mma.sync / wgmma) kernels - attention on the scalar kernels, "
+                "experts on the scalar rows and the limb (dp4a) path\n");
+#endif
     if (c.n_pass > 1) {
         std::printf("looped: layers %d .. %d run %d times - %d layer visits a token; message gates of rank %d\n", c.core0,
                     c.core1 - 1, c.n_pass, c.n_visit, c.rank);
@@ -4263,6 +4346,12 @@ int main(int argc, char** argv) {
     }
     g_ep = n_gpu == 2 && getenv("IK2_EP") && std::atoi(getenv("IK2_EP"));
     g_tp = n_gpu == 2 && !g_ep && getenv("IK2_TP") && std::atoi(getenv("IK2_TP"));
+    // A looped model's layers 12 .. 23 run on GPU 1 with the split, and its second and third passes read the pass's
+    // bank of block states, which the handoff between the GPUs does not copy: layer 12's attention then differs from a
+    // single GPU's by 0.84 at once (the logits by 18).  Until that copy is in, refuse the split instead of running it.
+    if (n_gpu > 1 && !dual() && c.n_pass > 1)
+        die("a looped model needs the experts' parallel split (IK2_EP=1 or IK2_TP=1): the layer split's second pass "
+            "reads a bank of block states the handoff does not carry across the GPUs, and its output is wrong");
     if (dual()) {
         int p01 = 0, p10 = 0;
         CU(cudaDeviceCanAccessPeer(&p01, 0, 1));
@@ -4287,6 +4376,9 @@ int main(int argc, char** argv) {
                     p01 && p10 ? "on" : "off: copies through the host");
     }
     use_dev(0);
+    if (g_prof2)
+        for (int slot = 0; slot < 9; ++slot)
+            for (int v = 0; v < 64; ++v) CU(cudaEventCreate(&g_p2ev[slot][v]));
     g_overlap = !getenv("IK2_OVERLAP") || std::atoi(getenv("IK2_OVERLAP"));
     for (auto& e : g_ring) CU(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     // (off by default: on an RTX PRO 6000 node's Xeon 6737P an NVFP4 expert takes 0.73 ms on 7 threads against 0.33 ms
@@ -4295,15 +4387,26 @@ int main(int argc, char** argv) {
         g_pool = new ik2::cpu::Pool(threads - 1);
     if (getenv("IK2_UP_MS")) g_t_up = std::atof(getenv("IK2_UP_MS")) * 1e-3;
     g_cpu_lazy = !getenv("IK2_CPU_LAZY") || std::atoi(getenv("IK2_CPU_LAZY"));
-    if (n_gpu > 1 && getenv("IK2_DENSE")) die("IK2_DENSE with --gpus > 1");
 
     // Do the experts all fit in VRAM beside the dense weights and the K / V cache (Inkling-2-Mini's 14.7 GiB on a 24 GB
     // card)?  Then they all stay there: the dense weights are kept as the GGUF's blocks unless IK2_DENSE says otherwise
     // (half an FP16 copy's bytes, a token's products straight over them) and tokens take the resident path
     // (IK2_FAST=0: off; IK2_GRAPH=0: its launches one by one instead of a CUDA graph a token).
     g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
+#if defined(STRATA_USE_HIP)
+    // The block path (a verify window's attention) and a token's attention on the tensor cores are mma.sync kernels
+    // (attn_block_mma / attn_decode_mma): a HIP build runs the scalar paths, and asks for the others rather than
+    // launching a stub.
+    if (getenv("IK2_BLOCK") && std::atoi(getenv("IK2_BLOCK")))
+        die("IK2_BLOCK=1: the verify window's attention is a tensor-core kernel, not built for HIP/gfx906");
+    g_block = false;
+    if (getenv("IK2_ATTN_MMA") && std::atoi(getenv("IK2_ATTN_MMA")))
+        die("IK2_ATTN_MMA=1: the attention on the tensor cores is not built for HIP/gfx906 (the scalar kernels run)");
+    g_attn_mma = 0;
+#else
     g_block = !(getenv("IK2_BLOCK") && !std::atoi(getenv("IK2_BLOCK")));
     g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
+#endif
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
     if (n_gpu == 1 && getenv("IK2_KV_MANAGED") && atoi(getenv("IK2_KV_MANAGED"))) {
         int concurrent = 0;
@@ -4336,6 +4439,55 @@ int main(int argc, char** argv) {
         std::printf("experts %.1f GiB, dense weights %.1f GiB as blocks, K / V cache %.1f GiB, %.1f GiB free: %s\n",
                     exp_b / 1073741824.0, dense_b / 1073741824.0, kv_b / 1073741824.0, fr0 / 1073741824.0,
                     fits ? "every expert stays in VRAM" : "the experts in host memory, a cache of them in VRAM");
+    } else if (g_ep) {
+        // EP: each device holds its own experts (ep_owner) beside its own share of everything else - GPU 0 runs every
+        // layer's attention and the dense weights, so the whole dense copy and the K / V cache are its own; GPU 1 has
+        // experts only.  The fit is per device, against the free VRAM its work buffers leave.
+        size_t exp_b = 0, dense_b = 0, kv_b = 0;
+        std::vector<size_t> layer_exp(c.n_layer, 0);
+        for (const auto& kv : S.by_name) {
+            const auto& t = *kv.second.second;
+            if (!k::block_values((int) t.type)) continue;
+            if (t.name.find("_exps.weight") != std::string::npos) {
+                exp_b += tensor_bytes(t);
+                if (t.name.rfind("blk.", 0) == 0) layer_exp[std::atoi(t.name.c_str() + 4)] += tensor_bytes(t);
+            } else if (t.name != "token_embd.weight") {
+                dense_b += tensor_bytes(t);
+            }
+        }
+        for (int l = 0; l < c.n_layer; ++l) {
+            const size_t cap = c.sliding[l] ? (size_t) std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : (size_t) ctx;
+            if (!g_kv_managed || c.sliding[l])
+                kv_b += (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
+        }
+        size_t exp_d[2] = {0, 0};
+        for (int l = 0; l < c.n_layer; ++l) {
+            int own[2] = {0, 0};
+            for (int e = 0; e < c.E; ++e) ++own[ep_owner(l, e)];
+            for (int d = 0; d < 2; ++d) exp_d[d] += layer_exp[l] * (size_t) own[d] / (size_t) c.E;
+        }
+        size_t fr_d[2] = {0, 0}, tot_d = 0;
+        for (int d = 0; d < n_gpu; ++d) {
+            use_dev(d);
+            size_t tot = 0;
+            CU(cudaMemGetInfo(&fr_d[d], &tot));
+            tot_d = tot;
+        }
+        use_dev(0);
+        const size_t reserve0 = (size_t) 3 << 29, reserve1 = (size_t) 1 << 29;
+        const bool fits = exp_d[0] + dense_b + kv_b + reserve0 <= fr_d[0] && exp_d[1] + reserve1 <= fr_d[1] &&
+                          exp_b <= (size_t) (2.0 * cache_gb * 1073741824.0);
+        // (the resident token path is single-device so far: the fit is measured and printed, the token loop stays the
+        // general EP one until the device-side pick split and the per-device tables are in.  Planar Q8 is opt-in under
+        // EP: it halves the dense bytes a token reads (decode 42.9 -> 43.2 tok/s measured) but a prefill chunk then
+        // dequantizes every projection per pass (421 -> 209 tok/s), so it is not enabled by default)
+        stage_cold = getenv("IK2_STAGE_COLD") && atoi(getenv("IK2_STAGE_COLD"));
+        std::printf("EP fit: experts %.1f GiB, dense %.1f GiB%s, K / V cache %.1f GiB; per device: GPU 0 %.2f + %.1f "
+                    "GiB vs %.1f free, GPU 1 %.2f + %.1f vs %.1f free: %s\n",
+                    exp_b / 1073741824.0, dense_b / 1073741824.0, g_dense_q8 ? " (planar Q8)" : "",
+                    kv_b / 1073741824.0, exp_d[0] / 1073741824.0, (dense_b + kv_b + reserve0) / 1073741824.0,
+                    fr_d[0] / 1073741824.0, exp_d[1] / 1073741824.0, (double) reserve1 / 1073741824.0,
+                    fr_d[1] / 1073741824.0, fits ? "every owned expert fits" : "the experts in host memory");
     }
 
     // the dense weights
@@ -4777,7 +4929,13 @@ int main(int argc, char** argv) {
     ik2::draft::Drafter* drafter = nullptr;
     uint16_t* draft_head = M.out_w.f16;
     if (!draft_path.empty()) {
-        if (n_gpu != 1) die("--draft: one GPU only so far");
+        // The drafter (its tensors, handle, stream and the taps) lives on GPU 0: one GPU, or two with the experts split
+        // (IK2_EP=1), where every layer's attention, dense weights, KV and taps are GPU 0's by construction.  The layer
+        // split is refused for a looped model before this point; TP with a drafter has not been checked.
+        if (n_gpu != 1 && !g_ep)
+            die("--draft: one GPU, or two with IK2_EP=1 (the drafter, the taps and the attention are GPU 0's; the "
+                "layer split is wrong for a looped model and IK2_TP=1 with a drafter is unchecked)");
+        use_dev(0);
         if (!draft_head && M.out_w.q8) {   // (a Q8_0 head: an FP16 copy for the drafter's base logits and its fold)
             const size_t n = (size_t) c.n_rows * c.C;
             draft_head = dalloc<uint16_t>(n);
@@ -5763,6 +5921,7 @@ int main(int argc, char** argv) {
         for (size_t j = 0; j < out.size(); ++j) std::printf("%d%s", out[j], j + 1 < out.size() ? "," : "\n");
     } else if (drafter) {
         // draft 7 after the anchor, verify the 8 in one call, keep the agreeing prefix and the target's next token
+        use_dev(0);
         float *raw = dalloc<float>(c.C), *anchor_h = dalloc<float>(c.C);
         auto argmax_row = [&](const float* r) { return (int) (std::max_element(r, r + c.n_vocab) - r); };
         int anchor = first_best, P = (int) prompt.size();
@@ -5774,6 +5933,7 @@ int main(int argc, char** argv) {
         while ((int) out.size() < gen && P < ctx) {
             const int B = std::min(width, ctx - P);
             const double t0 = now();
+            use_dev(0);   // (the drafter's and the target's GPU 0 buffers: forward() leaves the current device there)
             embed_row(M, anchor, raw, anchor_h);
             int dr[ik2::draft::kBlock - 1];
             if (B > 1) ik2::draft::propose(drafter, anchor, anchor_h, P, draft_head, c.n_rows, c.n_vocab, dr, B - 1);
@@ -5864,6 +6024,16 @@ int main(int argc, char** argv) {
                         std::printf("near tie at position %d: %d %.4f, %d %.4f\n", P + j, i1, b1, i2, b2);
                 }
             }
+            {   // (IK2_DRAFT_DUMP=n: the first n steps' proposals against the target's picks)
+                static const int dumps = getenv("IK2_DRAFT_DUMP") ? std::atoi(getenv("IK2_DRAFT_DUMP")) : 0;
+                if (n_steps < dumps) {
+                    std::printf("step %d at %d: anchor %d; drafts", n_steps, P, tk[0]);
+                    for (int j = 0; j < B - 1; ++j) std::printf(" %d", dr[j]);
+                    std::printf("; target");
+                    for (int j = 0; j < B - 1; ++j) std::printf(" %d", g[j]);
+                    std::printf("\n");
+                }
+            }
             int n = 0;
             while (n < B - 1 && dr[n] == g[n]) ++n;
             if (n + 1 < B) {
@@ -5903,6 +6073,11 @@ int main(int argc, char** argv) {
     if (g_pool)
         std::printf("CPU lane: %d threads, %llu experts computed on the CPU (%.2f ms each at the end), %llu waited for\n",
                     g_pool->size(), (unsigned long long) g_n_cpu, g_t_cpu * 1e3, (unsigned long long) g_n_wait);
+    if (g_prof2 && g_p2_tokens > 0) {
+        std::printf("attention sections (ms/token over %d tokens):", (int) g_p2_tokens);
+        for (int slot = 0; slot < 8; ++slot) std::printf(" %s %.2f", g_p2name[slot], g_p2acc[slot] / g_p2_tokens);
+        std::printf("\n");
+    }
     if (g_prof)
         std::printf("profile (all calls): attention %.2f s, router %.2f s, uploads %.2f s, experts %.2f s, rest %.2f s\n",
                     g_pf.attn, g_pf.route, g_pf.upload, g_pf.experts, g_pf.rest);

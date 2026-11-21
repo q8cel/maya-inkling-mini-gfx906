@@ -848,7 +848,7 @@ void test_attn_multi() {
     auto q = fvec((size_t) nq * H * D, 3.0f), r = fvec((size_t) nq * H * d_rel, 2.0f), sink = fvec((size_t) nq * H, 3.0f),
          proj = fvec((size_t) 1024 * d_rel);
     float *dk = dev(kc), *dv = dev(vc), *dq = dev(q), *dr = dev(r), *ds = dev(sink), *dp = dev(proj);
-    float *scratch = dev_n<float>((size_t) nq * H * (ctx + 32 * 130)), *out = dev_n<float>((size_t) nq * H * D),
+    float *scratch = dev_n<float>((size_t) nq * H * (ctx + 128 * 130)), *out = dev_n<float>((size_t) nq * H * D),
           *one = dev_n<float>((size_t) H * D);
     const float scale = 1.0f / std::sqrt(128.0f);
     struct Case { int pos0, window; const char* name; };
@@ -926,7 +926,7 @@ void test_attn_decode() {
     auto q = fvec((size_t) H * D, 3.0f), r = fvec((size_t) H * d_rel, 2.0f), sink = fvec(H, 3.0f),
          proj = fvec((size_t) 1024 * d_rel);
     float *dk = dev(kc), *dv = dev(vc), *dq = dev(q), *dr = dev(r), *ds = dev(sink), *dp = dev(proj);
-    float *scratch = dev_n<float>((size_t) H * ctx + (size_t) H * 32 * 130), *dout = dev_n<float>((size_t) H * D);
+    float *scratch = dev_n<float>((size_t) H * ctx + (size_t) H * 128 * 130), *dout = dev_n<float>((size_t) H * D);
     const float scale = 1.0f / std::sqrt(128.0f);
     for (const Case& cs : cases) {
         k::attn_decode(dq, dr, ds, dk, dv, H, KV, D, cs.k0, cs.nk, cs.qpos, scale, dp, d_rel, cs.extent, cs.window,
@@ -1070,7 +1070,7 @@ void test_attn_f16() {
          proj = fvec((size_t) 1024 * d_rel);
     uint16_t *dk_lin = dev(kc_lin), *dv_lin = dev(vc_lin), *dk_ring = dev(kc_ring), *dv_ring = dev(vc_ring);
     float *dq = dev(q), *dr = dev(r), *ds = dev(sink), *dp = dev(proj);
-    float *scratch = dev_n<float>((size_t) nq * H * (ctx + 32 * 130)), *out = dev_n<float>((size_t) nq * H * D),
+    float *scratch = dev_n<float>((size_t) nq * H * (ctx + 128 * 130)), *out = dev_n<float>((size_t) nq * H * D),
           *one = dev_n<float>((size_t) H * D);
     const float scale = 1.0f / std::sqrt(128.0f);
 
@@ -1207,6 +1207,21 @@ void test_token_path() {
         for (int r = 0; r < Nf; ++r)
             for (int i = 0; i < K; ++i) wantf[r] += (double) h2f_host(wf[(size_t) r * K + i]) * x[i];
         expect("mv_f16", host(dyf, Nf), wantf, 2e-4, 1e-3);
+        // the one-token row kernel (the dense products of a decode step): same rows, 16-byte loads
+        {
+            const int Kt = 1024, Nt = 37;   // (K a multiple of 8: 16-byte chunks)
+            std::vector<uint16_t> wt((size_t) Nt * Kt), xt(Kt);
+            for (auto& v : wt) v = f2h_host(frand());
+            for (auto& v : xt) v = f2h_host(frand());
+            uint16_t *dwt = dev(wt), *dxt = dev(xt);
+            float* dyt = dev_n<float>(Nt);
+            k::mv_f16_token(dwt, Nt, Kt, dxt, dyt, 0);
+            std::vector<double> wantt(Nt);
+            for (int r = 0; r < Nt; ++r)
+                for (int i = 0; i < Kt; ++i) wantt[r] += (double) h2f_host(wt[(size_t) r * Kt + i]) * h2f_host(xt[i]);
+            expect("mv_f16_token", host(dyt, Nt), wantt, 2e-4, 1e-3);
+            cudaFree(dwt), cudaFree(dxt), cudaFree(dyt);
+        }
         // the sinks in the clips' launch: mv_f16's values to the bit
         {
             const int H = 24, KV = 8, D = 128, d_rel = 16;
@@ -1362,6 +1377,7 @@ float e4m3fn_to_f32_host(uint8_t q);
 // 1 to 8 heads a K / V head, linear and ring caches, a window, the bias within and past its extent, the sink, a
 // first token, a context shorter than a step, splits with and without keys; the FP8 cache with every finite byte
 // (the subnormals among them).
+#if !defined(STRATA_USE_HIP)
 void test_attn_decode_mma() {
     const int D = 128, d_rel = 16;
     struct Case {
@@ -1550,6 +1566,7 @@ void test_attn_flash() {
         for (float* p : {db, ds, dout, dscr}) cudaFree(p);
     }
 }
+#endif  // !defined(STRATA_USE_HIP)   (test_attn_decode_mma and test_attn_flash are the mma.sync kernels', CUDA only)
 
 void test_round2_fused() {
     // 1. rms_f16: (with/without w) x (y16+y32, y16-only, y32-only) + unaligned/non-mult4 tail
@@ -2037,7 +2054,7 @@ void test_fp8_kv() {
              sink = fvec((size_t) nq * H, 3.0f), proj = fvec((size_t) 1024 * d_rel);
         uint8_t *dk_lin = dev(kc_lin), *dv_lin = dev(vc_lin), *dk_ring = dev(kc_ring), *dv_ring = dev(vc_ring);
         float *dq = dev(q), *dr = dev(r), *ds = dev(sink), *dp = dev(proj);
-        float *scratch = dev_n<float>((size_t) nq * H * (ctx + 32 * 130)), *out = dev_n<float>((size_t) nq * H * D),
+        float *scratch = dev_n<float>((size_t) nq * H * (ctx + 128 * 130)), *out = dev_n<float>((size_t) nq * H * D),
               *one = dev_n<float>((size_t) H * D);
 
         for (int ring = 0; ring < 2; ++ring) {
@@ -2608,6 +2625,7 @@ void test_expert_limbs() {
 
 // One token's NVFP4 experts through the tensor cores against the scalar kernels over the same blocks (every scale
 // byte, the subnormal ones and 0x7F with them): gate | up with the input as two FP16 limbs, down over the FP16 h.
+#if !defined(STRATA_USE_HIP)
 void test_experts_mma() {
     constexpr int C = 256, F = 128, S = 5;
     const int ty = k::kNVFP4;
@@ -2672,6 +2690,7 @@ void test_q8_verify_tile() {
     cudaFree(dw);
     cudaFree(ds);
 }
+#endif  // !defined(STRATA_USE_HIP)   (test_experts_mma and test_q8_verify_tile launch mma.sync kernels, CUDA only)
 
 int main() {
     int dev_count = 0;
@@ -2698,13 +2717,22 @@ int main() {
     test_round2_fused();
     test_fp8_kv();
     test_round6();
+#if !defined(STRATA_USE_HIP)
     test_attn_flash();   // (last: its random data leaves the others' as they were)
     test_attn_decode_mma();
+#else
+    // The four tensor-core tests (mma.sync m16n8k16) have no HIP kernels: their launchers abort, so they are skipped by
+    // name here and the scalar paths above are what a gfx906 run checks.
+    std::printf("skipped on HIP: test_attn_flash, test_attn_decode_mma, test_experts_mma, test_q8_verify_tile "
+                "(mma.sync kernels, CUDA only)\n");
+#endif
     test_cand_topk();
     test_token_path();
     test_expert_limbs();
+#if !defined(STRATA_USE_HIP)
     test_experts_mma();
     test_q8_verify_tile();
+#endif
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

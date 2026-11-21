@@ -164,7 +164,19 @@ __device__ float bmax(float v, float* sh) {
 
 constexpr int kBlk = 256;
 
+// HIP's backend fuses f16(f32(h) * s) - a product of a value converted from half and a scale - into one
+// v_fma_mixlo_f16 with a +0 addend, and -0 + +0 is +0: an FP8 cache's -0 byte then came out of unpack_kv_fp8_to_f16
+// as +0.  Keeping the product and the conversion apart (a register the compiler cannot see through) restores the
+// rounding the CUDA build does; CUDA has no such transformation.
+__device__ __forceinline__ float keep_product(float v) {
+#if defined(STRATA_USE_HIP)
+    asm("" : "+v"(v));
+#endif
+    return v;
+}
+
 __device__ __forceinline__ uint32_t f2_to_u32(float a, float b) {
+    a = keep_product(a), b = keep_product(b);
     const __half2 h2 = __float22half2_rn(make_float2(a, b));
     return (uint32_t) __half_as_ushort(__low2half(h2)) | ((uint32_t) __half_as_ushort(__high2half(h2)) << 16);
 }
@@ -886,6 +898,10 @@ __global__ void attn_probs_bias_f16_kernel(const float* lg, uint16_t* out16, int
     for (int j = j_hi + tid; j < nk; j += kBlk) row_out[j] = 0;
 }
 
+// The tensor-core paths (mma.sync m16n8k16 and Hopper's wgmma, with cp.async and ldmatrix) are PTX: a HIP build
+// compiles this file's scalar kernels and none of them.  Their launchers below abort if something still asks for
+// one; maya-ik2 on HIP runs the scalar attention and the limb (dp4a) experts.
+#if !defined(STRATA_USE_HIP)
 // Prefill attention in one pass (FlashAttention-2 style, tensor cores via mma.sync m16n8k16, FP16 in / F32
 // accumulate): the logits never leave registers.  A block: 64 queries (4 warps x 16) of one head against one split of
 // its keys, in tiles of 64; the online softmax in the log2 domain.  Each split writes its unnormalised output and its
@@ -1600,6 +1616,7 @@ __global__ void attn_decode_mma_combine_kernel(const float* __restrict__ o_part,
     out[(size_t) h * kFaD + d] = res;
     if (out16) out16[(size_t) h * kFaD + d] = f2h(res);
 }
+#endif  // !defined(STRATA_USE_HIP)
 
 template <bool WRITE_F16, bool WRITE_F32>
 __global__ void gate_mul_impl_kernel(float* o, const float* g, size_t n, uint16_t* o16) {
@@ -2654,6 +2671,7 @@ __global__ void nv_limb_mv(const uint8_t* const* blobs, const NvInput* packed, s
 }
 
 // Each warp multiplies 16 expert rows by the distinct token inputs in its group.
+#if !defined(STRATA_USE_HIP)
 __device__ __forceinline__ uint32_t ik2_fp4pair(uint32_t v, uint32_t scale) {
     const uint32_t mag = __byte_perm(0x42403c00u, 0x4a484644u, (v & 0x0707u) << 4);
     const uint32_t sign = ((v & 8u) << 12) | ((v & 0x800u) << 20);
@@ -2854,6 +2872,7 @@ experts_mma_kernel(const uint8_t* const* __restrict__ blob, size_t off, int C, i
         y[(size_t) slot * C + r + 8] = tot.y;
     }
 }
+#endif  // !defined(STRATA_USE_HIP)
 
 template <int WARPS, int ROWS>
 __global__ void experts_gate_up_kernel(const uint8_t* const* blob, const int* tok, int ty_gate, int ty_up, size_t eb0,
@@ -3517,6 +3536,12 @@ __device__ __forceinline__ float4 v_load4<uint8_t>(const uint8_t* vr, int lane) 
                        e4m3fn_to_f32(vr[o + 3]));
 }
 
+// A key's value times its weight joins the running sum here; CUDA's compiler fuses that product into the add (fma),
+// and a 16640-key FP8 cache of every byte value needs the accuracy: with the build's -ffp-contract=off (the bit-exact
+// checks' flag) the sum rounds twice a term and misses the test's tolerance by a fifth.  Only this kernel's range.
+#if defined(STRATA_USE_HIP)
+#pragma clang fp contract(on)
+#endif
 template <class KV>
 __device__ __forceinline__ void attn_flash_range(const float* qh, const float* rh, const KV* kc, const KV* vc,
                                                  int KD, int g, int kv_cap, int k0, int j0, int j1, int qpos,
@@ -3562,6 +3587,9 @@ __device__ __forceinline__ void attn_flash_range(const float* qh, const float* r
     *(float4*) (&sm_o[warp][o]) = o_w;
     __syncthreads();
 }
+#if defined(STRATA_USE_HIP)
+#pragma clang fp contract(off)
+#endif
 
 // Unified split kernel for both attn_decode (gridDim.z = 1) and attn_multi (gridDim.z = nq).
 template <class KV>
@@ -3598,7 +3626,8 @@ __global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, 
     pp[2 + tid] = o;
 }
 
-__global__ void attn_combine_kernel(const float* sink, const float* part, int H, int P, float v_inv_scale, float* out) {
+__global__ void attn_combine_kernel(const float* sink, const float* part, int H, int P, float v_inv_scale, float* out,
+                                    const float* gate = nullptr, uint16_t* out16 = nullptr) {
     const int h = blockIdx.x, qi = blockIdx.y, tid = threadIdx.x;
     const float* pp = part + ((size_t) qi * H + h) * P * 130;
     const float sk = sink[(size_t) qi * H + h];
@@ -3612,7 +3641,11 @@ __global__ void attn_combine_kernel(const float* sink, const float* part, int H,
         den += pp[(size_t) p * 130 + 1] * f;
         o += pp[(size_t) p * 130 + 2 + tid] * f;
     }
-    out[((size_t) qi * H + h) * 128 + tid] = (o / den) * v_inv_scale;
+    float res = (o / den) * v_inv_scale;
+    // (a token's gate and FP16 copy here: gate_mul's two passes a token, one launch less)
+    if (gate) res *= 1.0f / (1.0f + expf(-gate[(size_t) (qi * H + h) * 128 + tid]));
+    out[((size_t) qi * H + h) * 128 + tid] = res;
+    if (out16) out16[(size_t) (qi * H + h) * 128 + tid] = f2h(res);
 }
 
 template <int WARPS, int ROWS>
@@ -3738,6 +3771,7 @@ __device__ __forceinline__ bool mv_conv_row(const MvConv& cv, int row, float x_n
 // Quantized planar Q8 GEMM for the small verify/prefill tiles. One scale covers
 // both 16-wide MMA instructions. Packing the signed bytes via 1024+u is exact
 // for all 256 inputs; the product rounds to half as in decode_q8p_f16_kernel.
+#if !defined(STRATA_USE_HIP)
 template <int Splits>
 __global__ void q8_mma_tile(const int8_t* q, const uint16_t* scales, int N, int K, const uint16_t* x, int T, float* out,
                             int ldy) {
@@ -3785,6 +3819,7 @@ __global__ void q8_mma_tile(const int8_t* q, const uint16_t* scales, int N, int 
         if (row + 8 < N) out[(size_t)(token0 + 1) * ldy + row + 8] = v.w;
     }
 }
+#endif  // !defined(STRATA_USE_HIP)
 
 template <int WARPS, int StaticK = 0>
 __global__ void mv_q8p_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, int N, int runtime_k,
@@ -4429,6 +4464,7 @@ unsigned grid(size_t n, int b = kBlk) { return (unsigned) ((n + b - 1) / b); }
 // ---- the block path: a few tokens at once (2 .. 8, a speculative step's verify window) on the resident path
 
 // the keys of a window of T tokens at pos0 .. pos0 + T - 1: steps of 16 from the first token's k_lo to the last token
+#if !defined(STRATA_USE_HIP)
 __device__ __forceinline__ int wa_active_block(int pos0, int T, int window, int nw, int& k_lo, int& n_steps) {
     k_lo = window < (1 << 30) ? max(0, pos0 - window + 1) : 0;
     n_steps = (pos0 + T - k_lo + 15) >> 4;
@@ -4690,6 +4726,7 @@ __global__ void attn_block_combine_kernel(const float* __restrict__ o_part, cons
     out[(size_t) ix * kFaD + d] = res;
     if (out16) out16[(size_t) ix * kFaD + d] = f2h(res);
 }
+#endif  // !defined(STRATA_USE_HIP)
 
 // a few tokens' short conv (conv4_fused_kernel's arithmetic) with row strides; the history before and the inputs
 // kept for a rollback (rec_old [3][C], rec_x [T][C]: conv_hist_after's) when given
@@ -4732,6 +4769,29 @@ __global__ void rollback_block_kernel(const ConvRec* __restrict__ recs, int n) {
 #pragma unroll
         for (int j = 0; j < 3; ++j) rc.hist[(size_t) j * rc.C + c] = v[j];
     }
+}
+
+// y [N] = W [N][K] (FP16) . x [K] (FP16), F32 sums: a warp a row, 8 values a lane a step (16-byte loads of W and x).
+// K % 8 == 0 and both 16-byte aligned (the callers check).  hipBLAS' GEMM with T = 1 reads a layer's dense weights at
+// ~183 GB/s on gfx906; this reads them at the memory's speed (~840 GB/s measured on the 15104 x 2304 q | k | v | r |
+// gate matrix), which is the difference between 10.3 ms and 2.2 ms a token for the dense projections.
+__global__ void __launch_bounds__(128) mv_f16_token_kernel(const uint16_t* __restrict__ W, int N, int K,
+                                                           const uint16_t* __restrict__ x, float* __restrict__ y) {
+    const int row = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= N) return;
+    const uint4* w = (const uint4*) (W + (size_t) row * K);
+    const uint4* xv = (const uint4*) x;
+    const int k8 = K >> 3;
+    float a = 0.0f;
+    for (int i = lane; i < k8; i += 32) {
+        const uint4 wv = __ldg(w + i), xw = __ldg(xv + i);
+        a += h2f((uint16_t) wv.x) * h2f((uint16_t) xw.x) + h2f((uint16_t) (wv.x >> 16)) * h2f((uint16_t) (xw.x >> 16)) +
+             h2f((uint16_t) wv.y) * h2f((uint16_t) xw.y) + h2f((uint16_t) (wv.y >> 16)) * h2f((uint16_t) (xw.y >> 16)) +
+             h2f((uint16_t) wv.z) * h2f((uint16_t) xw.z) + h2f((uint16_t) (wv.z >> 16)) * h2f((uint16_t) (xw.z >> 16)) +
+             h2f((uint16_t) wv.w) * h2f((uint16_t) xw.w) + h2f((uint16_t) (wv.w >> 16)) * h2f((uint16_t) (xw.w >> 16));
+    }
+    a = wsum(a);
+    if (lane == 0) y[row] = a;
 }
 
 // y [T][N] = W [N][K] (FP16) . x [T][K]: mv_f16_kernel a token a grid row
@@ -4802,6 +4862,7 @@ __global__ void group_route_kernel(const int* __restrict__ top, const float* __r
 // gate rows and the same 8 of up, SPLIT warps each a stride of the 64-value blocks; the B columns are (member,
 // limb) pairs - column c the member c / 2's limb c % 2 of its input (limbs [T][2][C]) - NT tiles of 8 (members <=
 // 4 NT), so that the members' products read the expert's rows once.  h [slot][F] = SwiGLU of the member's rows.
+#if !defined(STRATA_USE_HIP)
 template <int SPLIT, int NT>
 __global__ void __launch_bounds__(SPLIT * 32)
 experts_block_gu_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n_g, const int* __restrict__ tok_g,
@@ -4926,6 +4987,7 @@ experts_block_down_kernel(const uint8_t* const* __restrict__ blob, const int* __
         y[(size_t) slot * C + r] = tot.y, y[(size_t) slot * C + r + 8] = tot.w;
     }
 }
+#endif  // !defined(STRATA_USE_HIP)
 
 
 // route() for a window, a block of E threads a token (route_token_kernel's picks: the same weights to the bit)
@@ -4965,6 +5027,7 @@ __global__ void route_rows_kernel(const float* __restrict__ logits, const float*
 
 // a lane's part of a Q8_0 block of its two rows (34 bytes: the FP16 scale, 32 int8): the scales, and the values
 // 8 t .. 8 t + 7 as four pairs (2-byte loads: a block is 2-byte aligned)
+#if !defined(STRATA_USE_HIP)
 struct Q8Step {
     uint32_t sa, sb;
     uint32_t a[4], b[4];
@@ -5096,6 +5159,7 @@ experts_block_down_q8_kernel(const uint8_t* const* __restrict__ blob, const int*
         y[(size_t) slot * C + r] = tot.y, y[(size_t) slot * C + r + 8] = tot.w;
     }
 }
+#endif  // !defined(STRATA_USE_HIP)
 
 }  // namespace
 
@@ -5146,6 +5210,38 @@ void conv4_res(const float* x, float* hist, const float* w, const float* dyn, in
 void conv4(const float* x, float* hist, const float* w, const float* dyn, int heads, int T, int C, float* y,
            cudaStream_t s) {
     conv4_res(x, hist, w, dyn, heads, T, C, nullptr, y, s);
+}
+// a token's K and V: conv4_fused_kernel's channel map, the K/V histories and weights their own, one launch
+__global__ void conv4_pair_kernel(const float* x0, float* hh0, const float* w0, float* y0, const float* x1,
+                                  float* hh1, const float* w1, float* y1, int T, int C) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const bool second = blockIdx.y != 0;
+    const float* x = second ? x1 : x0;
+    float* hh = second ? hh1 : hh0;
+    const float* wc = (second ? w1 : w0) + (size_t) c * 4;
+    float* y = second ? y1 : y0;
+    float h0 = hh[c], h1 = hh[(size_t) C + c], h2 = hh[(size_t) 2 * C + c];
+    const float a0 = wc[0], a1 = wc[1], a2 = wc[2], a3 = wc[3];
+    for (int t = 0; t < T; ++t) {
+        const size_t tc = (size_t) t * C + c;
+        const float xn = x[tc];
+        y[tc] = a0 * h0 + a1 * h1 + a2 * h2 + a3 * xn;
+        h0 = h1, h1 = h2, h2 = xn;
+    }
+    hh[c] = h0;
+    hh[(size_t) C + c] = h1;
+    hh[(size_t) 2 * C + c] = h2;
+}
+void conv4_pair(const float* x0, float* h0, const float* w0, float* y0, const float* x1, float* h1, const float* w1,
+                float* y1, int T, int C, cudaStream_t s) {
+    if (T <= 0 || T > kConvFusedMaxT) {   // (a longer run: each as conv4 does)
+        conv4(x0, h0, w0, nullptr, 0, T, C, y0, s);
+        conv4(x1, h1, w1, nullptr, 0, T, C, y1, s);
+        return;
+    }
+    conv4_pair_kernel<<<dim3((unsigned) ((C + 127) / 128), 2), 128, 0, s>>>(x0, h0, w0, y0, x1, h1, w1, y1, T, C);
+    check("conv4_pair");
 }
 
 template <bool FUSED_RMS>
@@ -5211,6 +5307,7 @@ void attn_probs_bias_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk
     check("attn_probs_bias_f16");
 }
 // the Hopper kernel (wgmma) on a 9.x GPU of a build with sm_90a; IK2_WGMMA=0: the mma.sync one everywhere
+#if !defined(STRATA_USE_HIP)
 bool fa_wgmma() {
     static const int on = [] {
         if (getenv("IK2_WGMMA") && !std::atoi(getenv("IK2_WGMMA"))) return 0;
@@ -5287,6 +5384,25 @@ int attn_flash_splits(int Tq, int H, int nk, int n_sm) {
     const int most = std::max(1, (nk + 16 * kFaBN - 1) / (16 * kFaBN));   // (>= 1024 keys a split)
     return std::max(1, std::min({want, most, 16}));
 }
+#else
+// The flash attention's tiles are the tensor cores' too: a HIP build has only the scalar paths (attn_split's and
+// attn_decode's).  Nothing below selects these unless IK2_FLASH=1 / IK2_ATTN_MMA=1 / IK2_EXPERT_MMA=1 or
+// IK2_Q8_TILE=1 asks for one, and maya-ik2's startup refuses those switches before a launch can reach them.
+[[noreturn]] static void ik2_hip_no_tensor_cores(const char* what) {
+    std::fprintf(stderr, "maya-ik2: %s: tensor-core path not built for HIP/gfx906\n", what);
+    std::abort();
+}
+void attn_flash_f16(const uint16_t*, int, const uint16_t*, const uint16_t*, int, int, int, int, int, int, float,
+                    const float*, int, int, const float*, float*, int, float*, size_t, int, cudaStream_t) {
+    ik2_hip_no_tensor_cores("attn_flash_f16");
+}
+void attn_flash_fp8(const uint16_t*, int, const uint8_t*, const uint8_t*, int, int, int, int, int, int, float, float,
+                    const float*, int, int, const float*, float*, int, float*, size_t, int, cudaStream_t) {
+    ik2_hip_no_tensor_cores("attn_flash_fp8");
+}
+int attn_flash_splits(int, int, int, int) { return 1; }
+#endif  // !defined(STRATA_USE_HIP)
+
 void attn_probs_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk, int qpos0, int kpos0, float qk_scale,
                     const float* r, int d_rel, const float* proj, int extent, int window, const float* sink,
                     cudaStream_t s) {
@@ -5617,8 +5733,14 @@ void expert_limb_mv(bool gate, const uint8_t* const* blob, size_t offset, int C,
     check("nv_expert_limb");
 }
 bool experts_mma_fits(int ty_gate, int ty_up, int ty_down, int C, int F) {
+#if defined(STRATA_USE_HIP)
+    (void) ty_gate, (void) ty_up, (void) ty_down, (void) C, (void) F;
+    return false;   // (its kernel is PTX: a HIP build runs the limb (dp4a) experts instead)
+#else
     return ty_gate == kNVFP4 && ty_up == kNVFP4 && ty_down == kNVFP4 && C % 64 == 0 && F % 64 == 0;
+#endif
 }
+#if !defined(STRATA_USE_HIP)
 static int experts_mma_split(bool gate) {
     static const int wg = getenv("IK2_EXPERT_MMA_SPLIT") ? atoi(getenv("IK2_EXPERT_MMA_SPLIT")) : 8;
     static const int wd = getenv("IK2_EXPERT_MMA_SPLIT_DOWN") ? atoi(getenv("IK2_EXPERT_MMA_SPLIT_DOWN")) : 4;
@@ -5652,6 +5774,16 @@ void experts_down_mma(const uint8_t* const* blob, int S, size_t off_down, const 
     launch_experts_mma<false>(blob, S, off_down, h, F, C, F, nullptr, nullptr, 0.0f, 0.0f, nullptr, y, s);
     check("experts_down_mma");
 }
+#else
+// (experts_mma_fits is false on HIP, so nothing selects these unless IK2_EXPERT_MMA=1 names them)
+void experts_gate_up_swiglu_mma(const uint8_t* const*, int, size_t, const uint16_t*, int, int, const float*,
+                                const float*, float, float, uint16_t*, cudaStream_t) {
+    ik2_hip_no_tensor_cores("experts_gate_up_swiglu_mma");
+}
+void experts_down_mma(const uint8_t* const*, int, size_t, const uint16_t*, int, int, float*, cudaStream_t) {
+    ik2_hip_no_tensor_cores("experts_down_mma");
+}
+#endif  // !defined(STRATA_USE_HIP)
 void experts_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
                      const float* x, int C, int F, float* gu, cudaStream_t s) {
     if (S <= 0) return;
@@ -5682,6 +5814,7 @@ void enable_grouped_tensor_products(bool enabled) { grouped_tensor_products = en
 void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, int G, int ty_down, size_t off_down,
                     const uint16_t* h, int C, int F, float* y, cudaStream_t s) {
     if (G <= 0) return;
+#if !defined(STRATA_USE_HIP)
     static const bool use_group_mma = getenv("IK2_GROUP_MMA") && (atoi(getenv("IK2_GROUP_MMA")) & 2);
     if (grouped_tensor_products && use_group_mma && ty_down == kNVFP4 && C % 16 == 0 && F % 64 == 0) {
         grouped_expert_mma<false, 4><<<dim3(C / 16, G), 128, 0, s>>>(blob, nullptr, off_down, C, F, h, nullptr, y,
@@ -5696,6 +5829,7 @@ void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, in
         check("q8 grouped MMA");
         return;
     }
+#endif  // !defined(STRATA_USE_HIP)
     const dim3 g((unsigned) ((C + kGroupWarps * kGroupRows - 1) / (kGroupWarps * kGroupRows)), (unsigned) G);
     experts_down_g_kernel<<<g, kGroupWarps * 32, 0, s>>>(blob, n, row, ty_down, off_down, h, C, F,
                                                          mv_row_bytes(ty_down, F), y);
@@ -5736,6 +5870,7 @@ void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const in
                               const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s,
                               const uint16_t* input16) {
     if (G <= 0) return;
+#if !defined(STRATA_USE_HIP)
     static const bool use_group_mma = getenv("IK2_GROUP_MMA") && (atoi(getenv("IK2_GROUP_MMA")) & 1);
     if (grouped_tensor_products && use_group_mma && input16 && ty_gate == kNVFP4 && ty_up == kNVFP4 && F % 8 == 0 && C % 64 == 0) {
         grouped_expert_mma<true, 4><<<dim3(F / 8, G), 128, 0, s>>>(blob, tok, eb0, C, F, nullptr, h, nullptr, sg, su,
@@ -5750,6 +5885,7 @@ void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const in
         check("q8 grouped MMA");
         return;
     }
+#endif  // !defined(STRATA_USE_HIP)
     const dim3 g((unsigned) ((F + kGroupWarps * kGroupSwigluRows - 1) / (kGroupWarps * kGroupSwigluRows)), (unsigned) G);
     experts_gate_up_swiglu_g_kernel<<<g, kGroupWarps * 32, 0, s>>>(blob, n, tok, row, ty_gate, ty_up, eb0, x, C, F,
                                                                    mv_row_bytes(ty_gate, C), mv_row_bytes(ty_up, C),
@@ -5841,14 +5977,17 @@ void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* 
 template <class KV>
 void attn_decode_impl(const float* q, const float* r, const float* sink, const KV* kc, const KV* vc, int kv_cap, int H,
                       int Hkv, int D, int k0, int nk, int qpos, float qk_scale, float v_inv_scale, const float* proj,
-                      int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s) {
+                      int d_rel, int extent, int window, float* scratch, float* out, const float* gate, uint16_t* out16,
+                      cudaStream_t s) {
     if (D != 128 || d_rel > 32) {
         std::fprintf(stderr, "ik2::k::attn_decode: D %d, d_rel %d\n", D, d_rel);
         std::abort();
     }
-    // Flash-Decode splits over chunks of ~64 keys, up to 128 blocks per head (partials written directly to scratch)
-    const int P = std::min(128, std::max(1, (nk + 63) / 64));
-    if (P == 1) {
+    // Flash-Decode splits over chunks of 32 keys, up to 128 blocks per head (partials written directly to scratch).
+    // A 255-key split costs 31 us a token at 32 keys, 42 at 64 and 75 at 128 (gfx906, FP8, 48 heads); past 4096 keys
+    // the 128-block cap binds and the split is the deep context's (128 x 64 keys at 32 keys a block).
+    const int P = std::min(128, std::max(1, (nk + 31) / 32));
+    if (P == 1 && !gate) {
         attn_decode_kernel<KV><<<H, 128, 0, s>>>(q, r, sink, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale,
                                                    v_inv_scale, proj, d_rel, extent, window, out);
         check("attn_decode");
@@ -5858,7 +5997,7 @@ void attn_decode_impl(const float* q, const float* r, const float* sink, const K
     attn_split_kernel<KV><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel,
                                                       extent, window, part, nullptr);
     check("attn_decode_split");
-    attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out);
+    attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out, gate, out16);
     check("attn_decode_combine");
 }
 
@@ -5866,29 +6005,36 @@ void attn_decode(const float* q, const float* r, const float* sink, const float*
                  int D, int k0, int nk, int qpos, float qk_scale, const float* proj, int d_rel, int extent, int window,
                  float* scratch, float* out, cudaStream_t s) {
     attn_decode_impl(q, r, sink, kc, vc, 0, H, Hkv, D, k0, nk, qpos, qk_scale, 1.0f, proj, d_rel, extent, window,
-                     scratch, out, s);
+                     scratch, out, nullptr, nullptr, s);
 }
 
 void attn_decode_f16(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                      int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale, const float* proj,
-                     int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s) {
+                     int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s, const float* gate,
+                     uint16_t* out16) {
     attn_decode_impl(q, r, sink, kc, vc, kv_cap, H, Hkv, D, k0, nk, qpos, qk_scale, 1.0f, proj, d_rel, extent, window,
-                     scratch, out, s);
+                     scratch, out, gate, out16, s);
 }
 
 void attn_decode_fp8(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                      int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale,
                      float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
-                     float* out, cudaStream_t s) {
+                     float* out, cudaStream_t s, const float* gate, uint16_t* out16) {
     attn_decode_impl(q, r, sink, kc, vc, kv_cap, H, Hkv, D, k0, nk, qpos, qk_scale, v_inv_scale, proj, d_rel, extent,
-                     window, scratch, out, s);
+                     window, scratch, out, gate, out16, s);
 }
 
+#if !defined(STRATA_USE_HIP)
 void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
              cudaStream_t s) {
     q8_mma_tile<4><<<dim3((N + 15) / 16, (T + 7) / 8), 128, 0, s>>>(q, d, N, K, x, T, y, ldy);
     check("q8_mma_tile");
 }
+#else
+void q8_tile(const int8_t*, const uint16_t*, int, int, const uint16_t*, int, float*, int, cudaStream_t) {
+    ik2_hip_no_tensor_cores("q8_tile");
+}
+#endif  // !defined(STRATA_USE_HIP)
 
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
                  const MvConv& c1, cudaStream_t s, const MvAlt& a0, const MvAlt& a1) {
@@ -5993,6 +6139,7 @@ void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const
     check("attn_decode_fp8_at (combine)");
 }
 
+#if !defined(STRATA_USE_HIP)
 int attn_decode_mma_blocks(int Hkv) {
     int dev = 0, n_sm = 0, occ16 = 0, occ8 = 0;
     cudaGetDevice(&dev);
@@ -6038,6 +6185,20 @@ void attn_decode_mma_fp8(const uint16_t* q16, const float* r, const float* sink,
     attn_decode_mma_impl(q16, r, sink, kc, vc, kv_cap, H, Hkv, pos, qpos, n_split, qk_scale, v_inv_scale, proj, d_rel,
                          extent, window, scratch, out, gate, out16, s);
 }
+#else
+int attn_decode_mma_blocks(int) { return 1; }   // (IK2_ATTN_MMA=0 on HIP: the count is never used for a launch)
+size_t attn_decode_mma_scratch(int, int) { return 0; }
+void attn_decode_mma_f16(const uint16_t*, const float*, const float*, const uint16_t*, const uint16_t*, int, int, int,
+                         const int*, int, int, float, const float*, int, int, int, float*, float*, const float*,
+                         uint16_t*, cudaStream_t) {
+    ik2_hip_no_tensor_cores("attn_decode_mma_f16");
+}
+void attn_decode_mma_fp8(const uint16_t*, const float*, const float*, const uint8_t*, const uint8_t*, int, int, int,
+                         const int*, int, int, float, float, const float*, int, int, int, float*, float*, const float*,
+                         uint16_t*, cudaStream_t) {
+    ik2_hip_no_tensor_cores("attn_decode_mma_fp8");
+}
+#endif  // !defined(STRATA_USE_HIP)
 
 void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk, int KD,
                           float k_inv_scale, float v_inv_scale, uint16_t* k_out16, uint16_t* v_out16,
@@ -6098,6 +6259,7 @@ void decode_host(int type, const uint8_t* blocks, size_t n, float* out) {
 
 // ---- the block path's launchers
 
+#if !defined(STRATA_USE_HIP)
 template <class KV, int NT>
 static void attn_block_launch(const uint16_t* q16, const float* r, int r_ld, const float* sink, const KV* kc,
                               const KV* vc, int kv_cap, int H, int Hkv, const int* pos, int T, int n_split,
@@ -6153,6 +6315,20 @@ void attn_block_fp8(const uint16_t* q16, const float* r, int r_ld, const float* 
                              proj, d_rel, extent, window, scratch, out, gate, gate_ld, out16, s);
 }
 size_t attn_block_scratch(int H, int T, int n_split) { return (size_t) n_split * kWaNW * T * H * (kFaD + 2); }
+#else
+// (IK2_BLOCK=0 on HIP: the verify window goes through forward()'s scalar attention)
+size_t attn_block_scratch(int, int, int) { return 0; }
+void attn_block_f16(const uint16_t*, const float*, int, const float*, const uint16_t*, const uint16_t*, int, int, int,
+                    const int*, int, int, float, const float*, int, int, int, float*, float*, const float*, int,
+                    uint16_t*, cudaStream_t) {
+    ik2_hip_no_tensor_cores("attn_block_f16");
+}
+void attn_block_fp8(const uint16_t*, const float*, int, const float*, const uint8_t*, const uint8_t*, int, int, int,
+                    const int*, int, int, float, float, const float*, int, int, int, float*, float*, const float*, int,
+                    uint16_t*, cudaStream_t) {
+    ik2_hip_no_tensor_cores("attn_block_fp8");
+}
+#endif  // !defined(STRATA_USE_HIP)
 
 void conv_block(const float* x, int x_ld, float* hist, const float* w, const float* dyn, int d_ld, int heads, int T,
                 int C, const float* res, int res_ld, float* y, int y_ld, float* rec_old, float* rec_x,
@@ -6173,6 +6349,11 @@ void mv_f16_rows(const uint16_t* W, int N, int K, const float* x, int x_ld, int 
     mv_f16_rows_kernel<4><<<dim3((unsigned) ((N + 3) / 4), (unsigned) T), 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld);
     check("mv_f16_rows");
 }
+void mv_f16_token(const uint16_t* W, int N, int K, const uint16_t* x, float* y, cudaStream_t s) {
+    if (N <= 0) return;
+    mv_f16_token_kernel<<<(unsigned) ((N + 3) / 4), 128, 0, s>>>(W, N, K, x, y);
+    check("mv_f16_token");
+}
 void f16_limbs_rows(const float* x, int T, int C, uint16_t* out, cudaStream_t s) {
     if (T <= 0) return;
     f16_limbs_rows_kernel<<<(unsigned) ((T * C + 255) / 256), 256, 0, s>>>(x, T, C, out);
@@ -6188,6 +6369,7 @@ void group_route(const int* top, const float* w, int S, int K, const uint8_t* co
     group_route_kernel<<<1, 64, 0, s>>>(top, w, S, K, tab, sg_t, su_t, sd_t, blob, n, tok, row, sg, su, wt, inv);
     check("group_route");
 }
+#if !defined(STRATA_USE_HIP)
 void experts_block_gu(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
                       size_t off_up, int C, int F, const uint16_t* limbs, const float* sg, const float* su, float gcap,
                       float ucap, uint16_t* h, cudaStream_t s) {
@@ -6204,6 +6386,17 @@ void experts_block_down(const uint8_t* const* blob, const int* n, const int* row
                                                                                          h, y);
     check("experts_block_down");
 }
+#else
+// (the group path's blocks are the tensor cores' too: IK2_GROUP=0 on HIP, so nothing selects them)
+void experts_block_gu(const uint8_t* const*, const int*, const int*, const int*, int, int, size_t, int, int,
+                      const uint16_t*, const float*, const float*, float, float, uint16_t*, cudaStream_t) {
+    ik2_hip_no_tensor_cores("experts_block_gu");
+}
+void experts_block_down(const uint8_t* const*, const int*, const int*, int, size_t, int, int, const uint16_t*, float*,
+                        cudaStream_t) {
+    ik2_hip_no_tensor_cores("experts_block_down");
+}
+#endif  // !defined(STRATA_USE_HIP)
 void prep_qkv_r_fp8_block(float* q, int q_ld, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in,
                           uint8_t* vc, float* r, int r_ld, const float* r_clip, int T, int H, int KV, int D, int d_rel,
                           float qk_clip, float rel_clip, float eps, const int* pos, bool log_scale, float alpha,
@@ -6241,6 +6434,7 @@ void route_rows(const float* logits, const float* bias, int T, int E, int K, flo
                                                                                                scale, top, w);
     check("route_rows");
 }
+#if !defined(STRATA_USE_HIP)
 void experts_block_gu_q8(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
                          size_t off_up, int C, int F, const uint16_t* limbs, const float* sg, const float* su,
                          float gcap, float ucap, uint16_t* h, cudaStream_t s) {
@@ -6257,5 +6451,16 @@ void experts_block_down_q8(const uint8_t* const* blob, const int* n, const int* 
                                                                                             F, h, y);
     check("experts_block_down_q8");
 }
+#else
+// (only the group path's tensor-core blocks; IK2_GROUP=0 on HIP, so nothing selects them)
+void experts_block_gu_q8(const uint8_t* const*, const int*, const int*, const int*, int, int, size_t, int, int,
+                         const uint16_t*, const float*, const float*, float, float, uint16_t*, cudaStream_t) {
+    ik2_hip_no_tensor_cores("experts_block_gu_q8");
+}
+void experts_block_down_q8(const uint8_t* const*, const int*, const int*, int, size_t, int, int, const uint16_t*, float*,
+                           cudaStream_t) {
+    ik2_hip_no_tensor_cores("experts_block_down_q8");
+}
+#endif  // !defined(STRATA_USE_HIP)
 
 }  // namespace ik2::k

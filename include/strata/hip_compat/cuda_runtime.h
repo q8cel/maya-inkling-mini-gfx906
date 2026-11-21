@@ -18,6 +18,8 @@
 #ifdef __noinline__
 #undef __noinline__
 #endif
+#define cudaCpuDeviceId hipCpuDeviceId
+#define cudaDevAttrConcurrentManagedAccess hipDeviceAttributeConcurrentManagedAccess
 #define cudaDevAttrMaxSharedMemoryPerBlockOptin hipDeviceAttributeMaxSharedMemoryPerBlock
 #define cudaDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
 #define cudaDevAttrClockRate hipDeviceAttributeClockRate
@@ -98,6 +100,12 @@ inline hipError_t cudaHostAlloc(T** p, size_t bytes, unsigned int flags) {
 #define cudaLaunchHostFunc hipLaunchHostFunc
 #define cudaMalloc hipMalloc
 #define cudaMallocHost(...) (::strata::hip_compat::malloc_host(__VA_ARGS__))
+#define cudaMallocManaged hipMallocManaged
+// ROCm 6.4's hipMemPrefetchAsync keeps CUDA 12's (ptr, bytes, device, stream) form; hipMemAdvise the same advice
+// enum values (hipMemoryAdvise).
+#define cudaMemAdvise hipMemAdvise
+#define cudaMemAdviseSetAccessedBy hipMemAdviseSetAccessedBy
+#define cudaMemAdviseSetPreferredLocation hipMemAdviseSetPreferredLocation
 #define cudaMemGetInfo hipMemGetInfo
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpy2D hipMemcpy2D
@@ -110,10 +118,12 @@ inline hipError_t cudaHostAlloc(T** p, size_t bytes, unsigned int flags) {
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #define cudaMemset hipMemset
 #define cudaMemsetAsync hipMemsetAsync
+#define cudaMemPrefetchAsync hipMemPrefetchAsync
 #define cudaPeekAtLastError hipPeekAtLastError
 #define cudaRuntimeGetVersion hipRuntimeGetVersion
 #define cudaSetDevice hipSetDevice
 #define cudaStreamBeginCapture hipStreamBeginCapture
+#define cudaStreamCaptureModeGlobal hipStreamCaptureModeGlobal
 #define cudaStreamCaptureModeThreadLocal hipStreamCaptureModeThreadLocal
 #define cudaStreamCaptureStatus hipStreamCaptureStatus
 #define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone

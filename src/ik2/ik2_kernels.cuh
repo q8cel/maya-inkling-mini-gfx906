@@ -38,6 +38,9 @@ void l2clip(const float* x, const float* scale, int rows, int G, int D, float th
 /// Then hist = the last 3 rows of xp.  y must not alias x.
 void conv4(const float* x, float* hist, const float* w, const float* dyn, int heads, int T, int C, float* y,
            cudaStream_t s);
+/// Two channel-mapped conv4s in one launch (a token's K and V: each its own history and weights).
+void conv4_pair(const float* x0, float* h0, const float* w0, float* y0, const float* x1, float* h1, const float* w1,
+                float* y1, int T, int C, cudaStream_t s);
 /// Residual-fused short conv: same as conv4, plus residual[t][c] added to y[t][c] when residual != nullptr.
 void conv4_res(const float* x, float* hist, const float* w, const float* dyn, int heads, int T, int C,
                const float* residual, float* y, cudaStream_t s);
@@ -251,7 +254,8 @@ void attn_multi_f16(const float* q, const float* r, const float* sink, const uin
                     int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s);
 void attn_decode_f16(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                      int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale, const float* proj,
-                     int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s);
+                     int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s,
+                     const float* gate = nullptr, uint16_t* out16 = nullptr);
 
 /// FP8 (E4M3FN) K / V cache variants: scale K by k_scale and V by v_scale on write; fold 1/k_scale into qk_scale
 /// and pass v_inv_scale = 1/v_scale on read.  slot = kv_cap > 0 ? (pos0 + t) % kv_cap : (pos0 + t).  D = 128.
@@ -266,7 +270,7 @@ void attn_multi_fp8(const float* q, const float* r, const float* sink, const uin
 void attn_decode_fp8(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                      int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale,
                      float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
-                     float* out, cudaStream_t s);
+                     float* out, cudaStream_t s, const float* gate = nullptr, uint16_t* out16 = nullptr);
 /// Unwrap nk KV rows starting at k0 from FP8 ring buffer into contiguous FP16 [nk, KD] scaled by k_inv_scale / v_inv_scale.
 void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk, int KD,
                           float k_inv_scale, float v_inv_scale, uint16_t* k_out16, uint16_t* v_out16,
@@ -446,6 +450,9 @@ void rollback_block(const ConvRec* recs, int n_recs, int n, cudaStream_t s);
 /// y [T][N] (rows y_ld apart) = W [N][K] (FP16) . x [T][K] (rows x_ld apart).
 void mv_f16_rows(const uint16_t* W, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
                  cudaStream_t s);
+/// y [N] = W [N][K] (FP16) . x [K] (FP16), F32 sums: a warp a row, 16-byte loads (K a multiple of 8, W and x 16-byte
+/// aligned).  A one-token dense product: the same bytes hipBLAS' GEMM with T = 1 reads at a fraction of the speed.
+void mv_f16_token(const uint16_t* W, int N, int K, const uint16_t* x, float* y, cudaStream_t s);
 /// x [T][C] as two FP16 limbs a token: out [T][2][C] (hi, lo).
 void f16_limbs_rows(const float* x, int T, int C, uint16_t* out, cudaStream_t s);
 /// route()'s picks of a window (S = T K <= 64 slots) grouped by expert on the device: blob [S], n [S] (0 past the
