@@ -110,7 +110,9 @@ The checkpoint was a partial write. `/disk/models/mtp.safetensors` had one 136 M
 nothing) and the first 14.8 MB of `markov_head.markov_w1`). Everything outside the hole was intact and matched
 `/disk/models/dspark/dspark-Inkling-2-Mini-BF16.gguf` - the BF16 conversion of the same checkpoint - for all 54
 tensors, so the hole was rebuilt from it byte for byte (the repaired file now agrees with that GGUF at every byte;
-sha256 `7c3b6513...a1d2`). The corrupt original is kept as `/disk/models/mtp.safetensors.hole-20261122`.
+sha256 `7c3b6513...a1d2`). The repaired `/disk/models/mtp.safetensors` is the only complete copy on this machine
+(`/disk/models/mtp-fresh/` holds just a download lock, a re-download is still blocked; the corrupt original is
+`/disk/models/mtp.safetensors.hole-20261122`), so `--draft` must be pointed at that file and nothing else.
 
 After the repair, at 255 / 512 / 32768 tokens (CLI, `--gen`, `IK2_DRAFT_WIDTH=5` unless noted):
 
@@ -181,3 +183,12 @@ warm; the per-GPU fill is 0.6 s; `READY` follows. Keep the GGUF page-cached for 
    tok/s) but a prefill chunk then dequantizes every projection per pass (421 → 209 tok/s): opt-in only.
 5. The drafter's verify window: the scalar block attention above (a window costs a plain token a row
    through `forward()`), and a sampler-aware accept rule before it can reach the server.
+6. The limb (`__dp4a`) expert kernels are bandwidth-bound where they read: kernel-only **294 GB/s** (gate+up 332,
+   down 240; **0.1217 ms** an 8-expert layer-visit = **5.84 ms a token** at 48 visits; the floor at the memory's
+   890 GB/s is 0.0403 ms). The non-invasive variants tried - preloading and unrolling, row pairs, a batched
+   SwiGLU, other block sizes - measured 0.1184 ms at best (**-2.9 %**, inside machine drift) and were reverted.
+   The promising route is an in-place planar repack of the resident NVFP4 slots (aligned quants plus one scale
+   dword) with an aligned `NvInput`, estimated **0.075 - 0.085 ms a visit** (+2 - 3 tok/s), but every slot-reading
+   expert kernel - the prefill grouped and scalar ones included - would have to learn the layout; not taken here.
+   The SwiGLU epilogue is 21 % of a visit (0.025 ms) and MUFU-latency bound, so the repack's gain is in the loads,
+   not the epilogue.
