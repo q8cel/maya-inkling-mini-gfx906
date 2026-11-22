@@ -3076,8 +3076,9 @@ struct SpecCtl {
     int wmax = 5;
     bool adapt = true;
     double c_plain = 7.8e-3, c[kBlockMax + 1] = {};
+    bool c_seen[kBlockMax + 1] = {};   // (a width measured at this context's depth)
     double S = 1, F = 1;   // (the drafts accepted, the ones rejected: decayed counts)
-    int plain_run = 0;
+    int plain_run = 0, fails = 0;      // (windows in a row that did not pay a token's time)
     int probe = getenv("IK2_DRAFT_PROBE") ? atoi(getenv("IK2_DRAFT_PROBE")) : 8;   // plain tokens before a look
     int probe_w = 4;
     double decay = getenv("IK2_DRAFT_DECAY") ? atof(getenv("IK2_DRAFT_DECAY")) : 0.85;
@@ -3092,13 +3093,18 @@ struct SpecCtl {
         if (bmax < 2) return 1;
         if (!adapt) return bmax;
         const double a = std::min(0.98, (S + 0.5) / (S + F + 1.0));
+        // the priors are 255-token-context timings; a width not yet measured at this depth is scaled by the plain
+        // token's measured time over the prior's, so a deep context does not open with windows it will drop
+        const double scale = c_plain / 7.8e-3;
         int best = 1;
         double vb = 1.0 / c_plain;
         for (int b = 2; b <= bmax; ++b) {
-            const double e = (1.0 - std::pow(a, b)) / (1.0 - a), v = e / c[b];
+            const double e = (1.0 - std::pow(a, b)) / (1.0 - a), v = e / (c_seen[b] ? c[b] : c[b] * scale);
             if (v > vb) vb = v, best = b;
         }
-        if (best == 1 && plain_run >= probe) best = std::min(probe_w, bmax);   // (a look at the acceptance again)
+        // after windows that did not pay, look less often (up to 8x the interval): a deep context's probe costs
+        // 2 - 3 plain tokens and must not tax the answer
+        if (best == 1 && plain_run >= probe * (1 << std::min(fails, 3))) best = std::min(probe_w, bmax);
         return best;
     }
     void took_plain(double t) {
@@ -3106,9 +3112,10 @@ struct SpecCtl {
         ++plain, ++plain_run;
     }
     void took_spec(int B, int acc, double t) {
-        c[B] = 0.8 * c[B] + 0.2 * t;
+        c[B] = 0.8 * c[B] + 0.2 * t, c_seen[B] = true;
         S = decay * S + acc, F = decay * F + (acc < B - 1 ? 1 : 0);
         ++steps, drafted += B - 1, accepted += acc, ++hist[acc];
+        fails = t / (acc + 1) > 1.15 * c_plain ? fails + 1 : 0;   // (its tokens cost more than plain's)
         plain_run = 0;
     }
 };
@@ -5891,6 +5898,7 @@ int main(int argc, char** argv) {
         const bool spec_on = drafter && g_fast && g_block;
         sctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
         sctl.adapt = !(getenv("IK2_DRAFT_ADAPT") && !atoi(getenv("IK2_DRAFT_ADAPT")));
+        if (drafter && !spec_on) sctl.probe = 12, sctl.probe_w = 2;   // (the fallback's look costs 2 - 3 plain tokens)
         while (next_line(line)) {
             std::istringstream in(line);
             std::string cmd, stops_s, ids_s, emb_path;
@@ -5989,6 +5997,22 @@ int main(int argc, char** argv) {
                 }
             }
             const int cached = (int) L;
+            // Serve-side speculative window (the CLI's `else if (drafter)` branch): with a drafter loaded but the
+            // resident block path unavailable (g_fast is set only on one GPU), each step proposes B - 1 drafts,
+            // verifies the anchor + drafts in one forward, and accepts the leading run of drafts that equals the
+            // target's own pick at that row.  Greedy: the argmax, exactly the CLI's rule.  Sampled: the target's
+            // draw from the request's own sampler (pick), so every accepted token is a sample from the target's
+            // distribution at its row and the sequence distribution is the plain one.  B comes from the same
+            // adaptive controller the resident path uses, so a window that does not pay (deep context) is dropped.
+            // (opt-in: IK2_SERVE_DRAFT=1.  Measured on this tip at 262144 context the window does not pay in serve -
+            //  33.6 against 41.0 tok/s on a 255-token prompt, q8 or FP16, because a window's step costs ~20 ms more
+            //  than a plain token here - so it is not on by default; the CLI's window is the paying path.)
+            const bool fallback_spec = drafter && !spec_on && getenv("IK2_SERVE_DRAFT") && std::atoi(getenv("IK2_SERVE_DRAFT"));
+            float* sraw = nullptr, *sanchor = nullptr;
+            if (fallback_spec) {
+                use_dev(0);
+                sraw = dalloc<float>(c.C), sanchor = dalloc<float>(c.C);
+            }
             const double t0 = now();
             const uint64_t miss0 = dev_cache(0).misses, bytes0 = dev_cache(0).bytes_up;
             for (auto& v : g_cnt_hist) v = 0;
@@ -6178,7 +6202,71 @@ int main(int argc, char** argv) {
                         continue;
                     }
                 }
-                const int B = spec_on ? sctl.choose(std::min(max_new - i - 1, ctx - (int) hist.size())) : 1;
+                const int B = (spec_on || fallback_spec)
+                                  ? sctl.choose(std::min(max_new - i - 1, ctx - (int) hist.size()))
+                                  : 1;
+                if (B >= 2 && fallback_spec) {
+                    const int P0 = (int) hist.size();
+                    const double ts = now();
+                    use_dev(0);
+                    embed_row(M, tok, sraw, sanchor);
+                    int dr[ik2::draft::kBlock - 1];
+                    ik2::draft::propose(drafter, tok, sanchor, P0, draft_head, c.n_rows, c.n_vocab, dr, B - 1);
+                    int tk[ik2::draft::kBlock];
+                    tk[0] = tok;
+                    for (int j = 1; j < B; ++j) tk[j] = dr[j - 1];
+                    const bool want_logits = temp > 0;
+                    std::vector<float> lo;
+                    std::vector<int> ag;
+                    g_rec = true;
+                    // (all_logits: every row's pick, not just the last - the taps are written either way)
+                    forward(M, tk, B, P0, true, want_logits ? OutMode::kLogits : OutMode::kArgmax, std::string(), lo, &ag,
+                            t_exp);
+                    g_rec = false;
+                    CU(cudaStreamSynchronize(g_s));
+                    int xs[ik2::draft::kBlock];
+                    if (want_logits) {
+                        for (int j = 0; j < B; ++j) xs[j] = pick(lo.data() + (size_t) j * c.n_vocab);
+                    } else {
+                        for (int j = 0; j < B && j < (int) ag.size(); ++j) xs[j] = ag[j];
+                    }
+                    int n = 0;
+                    while (n < B - 1 && dr[n] == xs[n]) ++n;
+                    int stop_at = -1;
+                    for (int j = 0; j < n; ++j)
+                        if (std::find(stops.begin(), stops.end(), dr[j]) != stops.end()) {
+                            stop_at = j;
+                            break;
+                        }
+                    const int kept = stop_at >= 0 ? stop_at : n;   // (the drafts that stay in the cache)
+                    if (kept + 1 < B) rollback(M, kept + 1);
+                    use_dev(0);
+                    ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, kept + 1, P0);
+                    ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, kept);
+                    sctl.took_spec(B, n, now() - ts);
+                    hist.push_back(tok);
+                    for (int j = 0; j < kept; ++j) {
+                        hist.push_back(dr[j]);
+                        std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", dr[j]);
+                    }
+                    int emitted = kept;
+                    if (stop_at >= 0) {   // (the stop ends the answer; it is not run through the cache)
+                        std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", dr[stop_at]);
+                        reason = "stop";
+                        ++emitted;
+                    }
+                    std::fflush(stdout);
+                    n_out += emitted, i += emitted;
+                    last.clear(), cand = false;
+                    if (stop_at >= 0) break;
+                    if (g_cancel) {
+                        reason = "cancelled";
+                        break;
+                    }
+                    if (temp <= 0) greedy_tok = xs[n];
+                    else pending_sample = xs[n];
+                    continue;
+                }
                 if (B >= 2) {
                     SampleCfg sc;
                     sc.temp = temp, sc.top_p = top_p, sc.top_k = top_k, sc.rng = &rng;
@@ -6219,7 +6307,7 @@ int main(int argc, char** argv) {
                     cand = use_cand && g_cand.n >= 0;
                     last = std::move(lo);
                 }
-                if (spec_on) {   // (the drafter's context for the token: its taps, row 0)
+                if (spec_on || fallback_spec) {   // (the drafter's context for the token: its taps, row 0)
                     use_dev(0);  // (the drafter's buffers are GPU 0's)
                     ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, 1, (int) hist.size());
                     ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, 0);
@@ -6231,10 +6319,15 @@ int main(int argc, char** argv) {
             if (suffix_stats.forwards)
                 std::fprintf(stderr, "suffix: %d target forwards verified %d inputs, accepted %d/%d proposals\n",
                              suffix_stats.forwards, suffix_stats.inputs, suffix_stats.accepted, suffix_stats.offered);
-            if (spec_on && getenv("IK2_STATS"))
+            if ((spec_on || fallback_spec) && getenv("IK2_STATS"))
                 std::fprintf(stderr, "speculative: %llu windows, %llu of %llu drafts accepted, %llu plain tokens\n",
                              (unsigned long long) sctl.steps, (unsigned long long) sctl.accepted,
                              (unsigned long long) sctl.drafted, (unsigned long long) sctl.plain);
+            if (fallback_spec) {
+                use_dev(0);
+                if (sraw) CU(cudaFree(sraw));
+                if (sanchor) CU(cudaFree(sanchor));
+            }
             if (serve_maya)
                 std::printf("DONE %d %zu %.1f %.1f %s %d %d %d\n", n_out, ids.size(), (t1 - t0) * 1e3,
                             (now() - t1) * 1e3, std::strcmp(reason, "cancelled") == 0 ? "cancel" : reason,

@@ -546,6 +546,39 @@ failures, plain unchanged (44.04 tok/s, `5608e98aa117`, same session, its path u
 tok/s with a warm page cache (344 on a cold one right after the tests - its path is untouched either way). Twelve clean runs alone are not conclusive at a 1-in-12 rate (p ~ 0.35); the change is
 justified as well by being strictly conservative - it adds an ordering and removes none.
 
+### The serve-side window (opt-in, `IK2_SERVE_DRAFT=1`)
+
+`--serve` with a drafter now has the CLI's fallback window: each step proposes `B - 1` drafts, verifies the anchor and
+the drafts in one `forward()` (T = B <= 8), accepts the leading run of drafts that equals the target's own pick at
+that row, rolls the convs back to the kept tokens, and carries the target's next token.  Greedy: the argmax, exactly
+the CLI's `dr[n] == argmax` rule, and **with the width pinned (`IK2_DRAFT_ADAPT=0 IK2_DRAFT_WIDTH=5`) the ids are the
+plain stream's, 64 of 64, twice** (q8, 262144, EP, DRAFT_CTX 65536).  Sampled: each row's token is the request's own
+draw through the serve loop's sampler (`pick`: temperature / top_k / top_p over the top 1000 - the same distribution
+plain sampling uses), so an accepted draft is a target sample and the sequence distribution is the plain one; the
+draws differ in count, so equal ids are only guaranteed at temperature 0.  The width comes from the same `SpecCtl`
+the resident path uses, now with two depth-aware fixes: a width not yet measured at this context is priced from its
+255-depth prior scaled by the plain token's measured time, and windows that did not pay make the next probe wait
+longer (up to 8x).  With `IK2_DRAFT_ADAPT` on, the width sequence follows the measured timings, so the stream may
+differ from plain at ulp-level ties only (observed at 2 positions on one prompt; the CLI has the same property).
+
+**It does not pay in serve at 262144, so it is opt-in**, measured on this tip at a 255-token prompt (63-token
+answers, `IK2_DRAFT_CTX=65536`, EP, FP8 KV, 262144 context):
+
+| dense | drafter | tok/s | mix |
+|---|---|---|---|
+| FP16 | off (plain) | **41.0** | - |
+| FP16 | window, adaptive | 33.6 | 16 windows (15 of 39 drafts), 32 plain |
+| q8 | off (plain) | **45.6** | - |
+| q8 | window, adaptive | 30.9 | 11 windows (9 of 22 drafts), 43 plain |
+
+A window's step costs ~+20 ms (FP16) or ~+60 ms (q8) more than a plain token in the serve path, so even a 38 %
+acceptance cannot pay it; the controller backs off to plain but the probes still cost ~25 %.  The CLI's window at
+131072 context is the paying path (48.0 against 43.1 tok/s); why the same width costs more per step in serve is open
+(the serve loop's `place_decode` and the deeper cache are the suspects), and until it is understood the window stays
+behind `IK2_SERVE_DRAFT=1` rather than regressing `--serve --draft` by ~20 %.  Streaming, cancellation and SIGTERM
+were re-checked with it on: one delta a token, a client disconnect ends the request (`cancel=True`), and the engine
+exits in ~1 s.
+
 ### The event sweep's two other victims, and the serve check
 
 The commit that introduced the window's per-visit copy events (`a7a9a0f`) renamed them in one sweep and took two
