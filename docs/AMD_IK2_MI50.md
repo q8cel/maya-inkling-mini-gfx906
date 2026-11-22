@@ -543,7 +543,7 @@ hit / miss split is gone, and with it the assumption. Measured after (2026-11-22
 33 C): **12 of 12 identical to plain** (`5608e98aa117` twelve times, 47.89 - 49.02 tok/s, mean 48.17, 3.00 tokens
 a window, verify 45.5 - 47.0 ms), 48.17 against 48.88 tok/s before (-1.5 %), `ik2_kernels_test` 357 checks, 0
 failures, plain unchanged (44.04 tok/s, `5608e98aa117`, same session, its path untouched) and the prefill 419 - 429
-tok/s (its path untouched). Twelve clean runs alone are not conclusive at a 1-in-12 rate (p ~ 0.35); the change is
+tok/s with a warm page cache (344 on a cold one right after the tests - its path is untouched either way). Twelve clean runs alone are not conclusive at a 1-in-12 rate (p ~ 0.35); the change is
 justified as well by being strictly conservative - it adds an ordering and removes none.
 
 ## Disabled on gfx906
