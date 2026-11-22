@@ -171,11 +171,40 @@ products. Measured with `IK2_DRAFT_ADAPT=0` (every step a window), 63 tokens aft
 | 511 ids, README | 5 | 3.00 | 42 of 84 (50 %) | 15.6 + 45.8 ms | **48.8 (42.7)** |
 | 32768 ids | 5 | 2.21 | 24 of 56 (43 %) | 20.9 + 78.0 ms | 22.4 (34.6) |
 
-A later session with the same binary measured every window configuration 1.4 - 1.5x slower than the table above
-(README width 5: 67 ms a window, 36.1 tok/s against plain 42.7) while plain decode (43.9) and the prefill (437 tok/s)
-were unchanged; the window's dense products and head are what moved (a width-8 window's projections 9.7 -> 13.4 ms,
-head 3.4 -> 4.8), the expert block did not (22.0 -> 22.9). Until that is explained, read the spec/plain ratio as
-+-25% between sessions; the same build also repeated a window's stream only 2 runs in 3 (see below).
+**Window drift: measured, and not the code.** A later session measured every window configuration 1.4 - 1.5x slower
+than the table above, so the previous commit was rebuilt in its own directory (`/tmp/ik2-a`, `git worktree` at
+`0fc0094`, same CMake flags and `STRATA_GGML_DIR`; `maya-ik2` md5 `bb801b6b9e8a9a32accedad48fd5426c`) and alternated
+with the branch tip's (`a7a9a0f`, md5 `d33c0342fc40fffa43396451521e4edc`) ABBA on the same prompts. The two are the
+same binary for this purpose:
+
+| README prompt, `IK2_DRAFT_ADAPT=0`, gen 63 | A `0fc0094` | B `a7a9a0f` |
+|---|---|---|
+| plain, tok/s | 38.96 | 39.09 |
+| width 5: drafting + verifying | 15.6 + 67.5 ms | 15.6 + 67.8 ms |
+| width 5, `IK2_WINPROF`: attention / experts / routing / head | 32.15 / 18.13 / 5.79 / 4.77 ms | 32.23 / 18.24 / 5.78 / 4.77 ms |
+
+So there is no regression to bisect: both commits measure the same today, section for section. What is left is the
+machine. Its clocks are not it: sampled under load, both cards sit at sclk 1801 MHz (700 idle), mclk 1000 MHz (the
+HBM2 maximum), junction 21 - 29 C, GPU 100 % - and the plain path is only 9 % slower today (README plain 38.96
+against 42.69 in the earlier session) while the window's *dense products and head* are ~40 % slower (width-8
+projections 9.7 -> 13.4 ms) and the expert block is not (22.1 -> 22.9). The box is shared: `load average 7.6` with
+other tenants' processes during these runs, and the model now reads from disk at 0.25 GiB/s a load (58 s) where the
+earlier session had it page-cached (0.37 GiB/s, 37 s). A window issues ~2400 launches (48 visits) and the T = 8 dense
+kernel reads its `x` operand eight times per weight chunk, so it is the most host- and L1/L2-sensitive path in the
+engine; that is where a busy machine shows first. Cause unproven beyond that, but the *condition* is: an idle box with the GGUF page-cached.
+Record the numbers with the condition or not at all.
+
+Under that shared-box condition the same runs measure (width 5, `IK2_DRAFT_ADAPT=0`, plain in brackets):
+
+| prompt | plain tok/s | drafting + verifying | tok/s | (idle-box row) |
+|---|---|---|---|---|
+| 255 ids | 43.9 | 15.6 + 65.2 - 66.4 ms (5 runs: 66.4, 65.2, 65.7, 65.3, 64.9) | 26.1 - 26.6 | 15.4 + 42.9, 38.6 |
+| 511 ids, README | 39.0 | 15.6 + 67.5 ms | 35.5 | 15.6 + 45.8, 48.8 |
+| 32768 ids | 34.6 | 20.9 + 78.1 ms | 22.3 | 20.9 + 78.0, 22.4 |
+
+So under a busy box the spec path is below plain at 255 and 32768 and 0.91x on the README prompt, where the idle-box
+numbers were 1.14x; the 32768 window is unchanged (its attention is not what a busy host hurts). A width-8 and
+width-3 row were not re-measured here: their idle-box numbers are the table above.
 
 The stream is the target's: the same 63 ids as plain decode on all three prompts except near ties (at 255: 159542 /
 152804 tie at 27.0161 / 27.0121; on the README prompt 197020 / 196978 early in the run - a window's summation order
@@ -201,8 +230,10 @@ A width-8 window at 255 tokens, section by section (`IK2_WINPROF=1`, 8 windows, 
 (a prompt's or an earlier layer's) was still in flight went with the *hits*, whose kernels do not wait for the copy
 stream (it now goes with the misses, as the token path's `slot_sseq` check does), and `g_ep_x / cp / done` were
 re-recorded every layer while the other device's wait on them might still be queued (each visit now has its own
-events, created on the device whose stream records them). Three repeat runs of the README prompt at width 5 then gave
-two identical streams and one that flipped a near tie early - not yet fully deterministic, and the open item below.
+events, created on the device whose stream records them). Three repeat runs of the README prompt at width 5 then gave two identical streams and one that flipped a near tie
+early; on a cleared machine five consecutive runs at 255 / width 5 / gen 63 (both binaries were idle, no other engine
+running) produced **the same 62 ids in all five** (md5 `d15d908bd809bc23ba2af03f89053f86`), so what remains is the
+same host-contention sensitivity the window shows everywhere else, not a repeated engine fault.
 
 What is left in the window, in the order the profile puts it: the experts' 297 GB/s is one device's rate (each of the
 two devices reads ~3.2 GB in the 22 ms, i.e. 147 GB/s against `nv_limb_mv`'s 294 - the grouped kernel's extra dots are
@@ -260,9 +291,10 @@ warm; the per-GPU fill is 0.6 s; `READY` follows. Keep the GGUF page-cached for 
    or `exp2f` (2 instructions) if a last-bit change is acceptable.
 4. Planar Q8 dense (`IK2_DENSE=q8`) works with EP and halves the dense bytes a token reads (42.9 → 43.2
    tok/s) but a prefill chunk then dequantizes every projection per pass (421 → 209 tok/s): opt-in only.
-5. The drafter's verify window. It is **not yet deterministic** run to run (2 of 3 repeats): the two-device expert
-   path needs an audit for a remaining copy/eviction race (the token path's `slot_sseq` check and per-visit events are
-   in; a slot evicted by a later layer while an earlier layer's kernel still reads it is the next suspect). Then: the
+5. The drafter's verify window: deterministic at 255 (5 of 5 repeats, above) after the copy-stream and event fixes,
+   but one README repeat in three still flipped a near tie where the box was busy - the next suspect is a host-side
+   pack buffer reused before the GPU consumed it (the window's pack ring is four deep, one a device a layer) rather
+   than the expert path. Then: the
    experts' 297 GB/s over the two devices is one device's rate (147 GB/s a device against `nv_limb_mv`'s 294), the
    window's dense GEMV reads 195 GB/s against `mv_f16_token`'s 840 (a shared-memory tile of `x` and a warp 4 rows of
    the matrix both measured slower and were dropped), and the routing's 48 D2H syncs (4 ms) need device-side expert
