@@ -458,6 +458,39 @@ repack of one slot into a scratch buffer (no second copy in the real path - the 
 planar layout *the* layout), and a kernel-only GB/s figure against the 294 GB/s the linear limb kernel measures today
 (the 0.1217 ms an 8-expert layer-visit at 48 visits). The migration list above is the scope of that change.
 
+### ... and the prototype says no: the layout axis is closed
+
+A self-contained `/tmp` TU (the repo's `NvInput`, `pack_limbs`, `nv_expand`/`nv_dot_vals`/`nv_dot_words`,
+`nv_limb_dot`, `ue4m3`, `wsum` copied verbatim, `-ffp-contract=off`, the same grid, threads and 128-thread blocks as
+`expert_limb_mv`'s launches) ran the linear kernel and a planar one on the same data: 8 experts, C = 2304, F = 1152, a
+slot of 4 478 976 B (1 492 992 a part), 200 launches a measurement. The planar kernel reads two 16-value sub-blocks from
+one 16-byte quant load and the pair's two scales from one 16-bit load, the scales in a plane of their own
+(`[rows][K/64][4]`), the quants in `[rows][K/64][32]`, rows 16-byte aligned; the repack is a device kernel (one thread a
+64-value block) run outside the timed loop.
+
+| 8 experts a launch | linear | planar | |
+|---|---|---|---|
+| gate / up | 341.7 GB/s, 0.0699 ms | 284.9 GB/s, 0.0838 ms | 0.83x |
+| down | 254.2 GB/s, 0.0470 ms | 215.7 GB/s, 0.0554 ms | 0.85x |
+| a visit (both) | **306.6 GB/s, 0.1169 ms** | **257.1 GB/s, 0.1393 ms** | **0.84x** |
+
+The baseline reproduces the kernel this tree runs (the doc's 294 GB/s / 0.1217 ms a visit; this harness is 4 % faster,
+the same shape). The reason the planar form loses is in the metadata: `llvm-readelf -n` on the object gives **41 VGPRs**
+(`Gate`), 38 (down), no spills for the linear kernel against **64 VGPRs**, no spills, for the planar one - 128-thread
+blocks, so 12 blocks a CU against 8. The two sub-blocks in flight cost ~23 registers (two `uint4` quants and two packed
+`NvInput`s) and a third of the occupancy, and this kernel lives on occupancy: it is 84 % of nothing but latency. A
+one-sub-block planar kernel would keep the VGPRs and do exactly today's loads (8 B of quants + a scale byte), only from
+two planes - the scale plane being one more stream, i.e. no win to be had there.
+
+Once at fill the repack costs **0.191 ms an expert** (23.4 GB/s over 4.5 MB) - off the hot path, and a cold fill of 1536
+experts would add ~0.3 s to the 39 s the pinned copy already takes; not the objection. The objection is the kernel. The
+planar down phase agrees with the linear kernel to 6.5e-4 relative worst (a reordering over 72 - 144 terms), so the
+maths is comparable; it just cannot be made faster this way.
+
+**So the layout axis is closed**: 257 GB/s a visit against 307 today, well under the 380 GB/s the migration would have
+needed to be worth its seven decode sites. The limb kernels keep their 36-byte blocks; the remaining limb headroom is
+the SwiGLU epilogue and the memory floor the doc already records, not the slot's layout.
+
 ## Disabled on gfx906
 
 * **Tensor-core attention and experts** (`mma.sync m16n8k16`, Hopper `wgmma`, `cp.async`, `ldmatrix`,
