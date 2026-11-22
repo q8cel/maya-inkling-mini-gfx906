@@ -75,8 +75,9 @@ accepts the expert types; on HIP that predicate returns false, so the EP token p
 kernels. Both MMA entry points are stubs that abort with a clear message, so naming them directly fails loudly
 instead of launching nothing. Upstream's other additions are device-agnostic and run unchanged on HIP:
 `IK2_CPU_Q8`, `IK2_LAZY_CPU` / `_MAX` / `_PER` / `_STREAM` (single GPU), `IK2_ROOM_MIB`, the drafter-aware fit
-message and the `resident=` field of the server's `INFO` line. The new `n_gpu > 1 && IK2_DENSE` refusal matches this
-port's EP-only two-card model.
+message and the `resident=` field of the server's `INFO` line. Upstream's new `n_gpu > 1 && IK2_DENSE` refusal is
+CUDA-only here, so the port's documented EP + planar-Q8 opt-in still runs: `IK2_DENSE=q8` on the 512-id prompt
+measured 43.78 tok/s decode and 366.9 tok/s prefill.
 
 Measured after the merge (two runs each, same box and commands as the table above):
 
@@ -320,7 +321,9 @@ warm; the per-GPU fill is 0.6 s; `READY` follows. Keep the GGUF page-cached for 
    LDS table read feeding the dot. Next shapes: a warp taking 4 keys with 8-lane reduces (9 shuffles per 4 keys),
    or `exp2f` (2 instructions) if a last-bit change is acceptable.
 4. Planar Q8 dense (`IK2_DENSE=q8`) works with EP and halves the dense bytes a token reads (42.9 → 43.2
-   tok/s) but a prefill chunk then dequantizes every projection per pass (421 → 209 tok/s): opt-in only.
+   tok/s before the sync; 43.0 → 43.8 on the 512-id README prompt after it). The old prefill penalty did not
+   reproduce on that prompt after the sync (366.9 against 362.4 tok/s plain), so treat `421 → 209` as
+   chunk/context-dependent and measure before enabling: opt-in only.
 5. The drafter's verify window: deterministic at 255 (5 of 5 repeats, above) after the copy-stream and event fixes,
    but one README repeat in three still flipped a near tie where the box was busy - the next suspect is a host-side
    pack buffer reused before the GPU consumed it (the window's pack ring is four deep, one a device a layer) rather

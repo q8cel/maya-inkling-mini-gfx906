@@ -4799,7 +4799,11 @@ int main(int argc, char** argv) {
         CU(cudaDeviceGetStreamPriorityRange(&lo, &hi));
         CU(cudaStreamCreateWithPriority(&g_ls, cudaStreamNonBlocking, lo));
     }
+#if !defined(STRATA_USE_HIP)
+    // (CUDA's planar-Q8 dense path is single-device; the HIP EP token loop reads the blocks on GPU 0, so the
+    //  port's IK2_DENSE=q8 opt-in under --gpus 2 stays available - see docs/AMD_IK2_MI50.md)
     if (n_gpu > 1 && getenv("IK2_DENSE")) die("IK2_DENSE with --gpus > 1");
+#endif
 
     // Do the experts all fit in VRAM beside the dense weights and the K / V cache (Inkling-2-Mini's 14.7 GiB on a 24 GB
     // card)?  Then they all stay there: the dense weights are kept as the GGUF's blocks unless IK2_DENSE says otherwise
