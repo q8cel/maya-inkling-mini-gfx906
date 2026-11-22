@@ -328,6 +328,9 @@ bool g_prof2 = false;
 cudaEvent_t g_p2ev[9][64];
 double g_p2acc[8];
 double g_p2_tokens = 0;
+double g_p2wacc[8];   // (the same sections of a verify window, IK2_PROF2 with a drafter)
+long g_p2w_wins = 0;
+double g_p2w_wall = 0;
 int g_p2_vis = 0;
 inline void p2(int vis, int slot) {
     if (g_prof2) cudaEventRecord(g_p2ev[slot][vis], g_s);
@@ -339,6 +342,7 @@ const char* const g_p2name[8] = {"gates/msg", "res+rms", "proj(qkv+sink)", "kv c
 // experts (copies, kernels, combine), the rest (the two convs), and the head.  It also counts the window's slots, the
 // distinct experts they took, and the experts copied in from host memory (the ones this GPU's cache did not hold).
 bool g_winprof = false;
+bool g_wp_host = false;   // IK2_WINPROF=2: the host's issue time a section (no stream sync: the GPU's work hides)
 double g_wp[7];
 long g_wp_wins = 0, g_wp_visits = 0, g_wp_slots = 0, g_wp_union = 0, g_wp_miss = 0;
 double g_wp_exp_bytes = 0, g_wp_miss_bytes = 0;
@@ -421,6 +425,8 @@ T* dalloc(size_t n) {
     return p;
 }
 
+bool g_rec = false;   // (a verify window's forward: its dense products and rollback records take other paths)
+
 // Y [T][N] (ldy) = X [T][K] FP16 . W [N][K]^T FP16, F32 sums
 void gemm16(const uint16_t* W, int N, int Kd, const uint16_t* X, int T, float* Y, int ldy, float beta = 0.0f) {
 #if defined(STRATA_USE_HIP)
@@ -429,6 +435,14 @@ void gemm16(const uint16_t* W, int N, int Kd, const uint16_t* X, int T, float* Y
     // products' order differs from hipBLAS' (a lane's strided sum), the same on every GPU of a run.
     if (T == 1 && beta == 0.0f && Kd % 8 == 0 && (((uintptr_t) W | (uintptr_t) X) & 15) == 0) {
         k::mv_f16_token(W, N, Kd, X, Y, g_s);
+        return;
+    }
+    // A verify window's: hipBLAS' GEMM at 2 .. 8 rows read the same weights at 45 GB/s on gfx906 (measured: a window's
+    // projections 37 ms against 4.3 ms of dense work a token), the warp-a-row kernel once for every row at 195.
+    static const bool gemv_win = !(getenv("IK2_GEMV_WIN") && !std::atoi(getenv("IK2_GEMV_WIN")));
+    if (T >= 2 && T <= 8 && g_rec && gemv_win && beta == 0.0f && Kd % 8 == 0 &&
+        (((uintptr_t) W | (uintptr_t) X) & 15) == 0) {
+        k::mv_f16_multi(W, N, Kd, T, X, Y, ldy, g_s);
         return;
     }
 #endif
@@ -687,7 +701,6 @@ void mv1c(const Mat& m, const float* x, float* y, const k::MvConv& c0, const k::
         if (cv->n) k::conv4_res(y + cv->r0, cv->hist, cv->w, cv->dyn, cv->heads, 1, cv->n, cv->res, cv->y, g_s);
 }
 
-bool g_rec = false;
 bool allow_short_batch_products() {
     static const bool verify_only = getenv("IK2_VERIFY_ONLY") && atoi(getenv("IK2_VERIFY_ONLY"));
     return !verify_only || g_rec;
@@ -2624,6 +2637,32 @@ struct BlockBufs {
 BlockBufs g_blk;
 FastGraph g_bgraph[kBlockMax + 1][4];   // by window size and OutMode
 
+// A verify window's experts over both GPUs' caches (IK2_EP_WIN=0: off): each device's group table of the picks it owns
+// (blob, n, tok, row, sg, su in one pinned pack a layer, uploaded to that device) and the combine's rows and weights.
+bool g_ep_win = true;
+struct WinBufs {
+    bool ready = false;
+    uint8_t* pack_h[2] = {};   // pinned [5632]: this device's groups (blob, n, tok, row, sg, su)
+    uint8_t* pack_d[2] = {};
+    uint8_t* cmb_h = nullptr;  // pinned [512]: the combine's rows and weights (GPU 0)
+    uint8_t* cmb_d = nullptr;
+    int ngroups = 0, nmiss = 0;   // (this layer's groups over both devices, and the picks copied in from host)
+} g_win;
+void win_init() {
+    if (g_win.ready) return;
+    const int d0 = g_cur;
+    CU(cudaHostAlloc(&g_win.cmb_h, 512, cudaHostAllocPortable));
+    use_dev(0);
+    g_win.cmb_d = dalloc<uint8_t>(512);
+    for (int d = 0; d < 2; ++d) {
+        use_dev(d);
+        CU(cudaHostAlloc(&g_win.pack_h[d], 5632, cudaHostAllocPortable));
+        g_win.pack_d[d] = dalloc<uint8_t>(5632);
+    }
+    use_dev(d0);
+    g_win.ready = true;
+}
+
 void block_init(Model& M) {
     if (g_blk.ready) return;
     const Config& c = M.c;
@@ -3148,6 +3187,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         for (int t = 0; t < T; ++t) W.pos_h[t] = pos0 + t;
         CU(cudaMemcpyAsync(W.pos, W.pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, g_s));
     }
+    const double fw_t0 = now();
     int nb = 0;
     const size_t TC = (size_t) T * C;
     auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
@@ -3226,7 +3266,9 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         }
         p2(vis, 1);
         g_p2_vis = vis;
+        wlap(g_wp[0]);
         run_layer_attn(M, Ly, l, T, pos0, W.h, W.pos, nb, 0, W.r, W, msg);
+        wlap(g_wp[1]);
         dump_f("blk." + std::to_string(vis) + ".attn_out", W.r, TC);
         if (l % c.block == 0) ++nb;
         // the MoE
@@ -3248,6 +3290,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
         }
         p2(vis, 8);
+        wlap(g_wp[2]);
         g_pf.lap(g_pf.attn);
         gemm16(Ly.router16, c.E, C, W.x16, T, W.rlog, c.E);
         const int S = T * c.K;
@@ -3263,6 +3306,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         const float* w = (const float*) (W.route_h + S);
         pop_count(l, top, S);
         g_pf.lap(g_pf.route);
+        wlap(g_wp[3]);
         if (!dump.empty()) {   // the experts picked, [T][K] int32 (compare with the reference's blk.L.picks)
             FILE* f = std::fopen((dump + "/blk." + std::to_string(vis) + ".picks.i32").c_str(), "wb");
             if (f) std::fwrite(top, 4, (size_t) S, f), std::fclose(f);
@@ -3382,6 +3426,119 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         // Q8_0 whole (the input rows go in as two 8-bit limbs, 15 bits of the F32 input); else the row kernels.
         const bool q8_limb = Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0 && Ly.ty[2] == k::kQ8_0;
         const bool nv_limb = Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4;
+        // A verify window's experts over both GPUs' caches: the window's slots split by ep_owner (GPU 0 the even
+        // experts, GPU 1 the odd, each with its own cache and PCIe link), every expert read once for all of its rows
+        // by the limb (dp4a) grouping (nv_limb_mv_g) instead of once a row by the scalar row kernels.  Each device
+        // groups the slots it owns by expert on the host (the routing round trip this window makes anyway), runs its
+        // hits while its misses copy in, and GPU 1's y [S][C] comes to GPU 0 for the combine.
+        if (g_ep_win && g_ep && !g_tp && T > 1 && T <= 8 && g_overlap && !g_prof && (q8_limb || nv_limb) &&
+            C % 64 == 0 && c.F % 64 == 0) {
+            const double te0 = now();
+            const int F = c.F;
+            win_init();
+            int dev_of[64];
+            for (int i = 0; i < S; ++i) dev_of[i] = ep_owner(l, top[i]);
+            g_win.ngroups = 0, g_win.nmiss = 0;
+            {
+                int* iv = (int*) g_win.cmb_h;
+                float* wv = (float*) (g_win.cmb_h + 256);
+                for (int i = 0; i < S; ++i) {
+                    iv[i] = (dev_of[i] ? 64 : 0) + i;   // (GPU 1's rows land past GPU 0's S in y32)
+                    wv[i] = w[i] * (Ly.scale[2].empty() ? 1.0f : Ly.scale[2][top[i]]);
+                }
+            }
+            CU(cudaEventRecord(g_ep_x, g_dev[0].s));   // (this layer's x -- the MoE's input -- is ready on GPU 0)
+            for (int d = 1; d >= 0; --d) {
+                use_dev(d);
+                Work& Wd = dev_work(d);
+                ExpertCache& Ed = dev_cache(d);
+                const uint64_t tick = ++Ed.tick;
+                if (d == 1) {
+                    CU(cudaStreamWaitEvent(g_s, g_ep_x, 0));
+                    CU(cudaMemcpyPeerAsync(Wd.xq, 1, dev_work(0).xq, 0, TC * 4, g_s));
+                }
+                // this device's slots: its cache's slot each (a miss copied on the copy stream), hits first
+                const uint8_t* where[64];
+                int hit[64], mis[64], nh = 0, nm = 0;
+                for (int i = 0; i < S; ++i) {
+                    if (dev_of[i] != d) continue;
+                    bool missed = false;
+                    where[i] = Ed.get(Ly, l, top[i], tick, g_cs, &missed, true, false);
+                    (missed ? mis[nm++] : hit[nh++]) = i;
+                }
+                CU(cudaEventRecord(g_ep_cp[d], g_cs));   // (the misses' bytes: the hits' kernels go first)
+                uint8_t* pk = g_win.pack_h[d];
+                auto** gb = (const uint8_t**) pk;
+                int* gn = (int*) (pk + 512), *gtok = (int*) (pk + 768), *grow = (int*) (pk + 2816);
+                float* gsg = (float*) (pk + 4864), *gsu = (float*) (pk + 5120);
+                g_win.nmiss += nm;
+                int gexp[64], n_part[2] = {0, 0}, g0 = 0;
+                for (int part = 0; part < 2; ++part) {
+                    const int n = part ? nm : nh;
+                    for (int j = 0; j < n; ++j) {
+                        const int i = (part ? mis : hit)[j], e = top[i];
+                        int g = -1;
+                        for (int u = g0; u < g0 + n_part[part]; ++u)
+                            if (gexp[u] == e) { g = u; break; }
+                        if (g < 0) {
+                            g = g0 + n_part[part]++;
+                            gexp[g] = e, gb[g] = where[i], gn[g] = 0;
+                        }
+                        const int m = gn[g]++;
+                        gtok[g * k::kGroupMax + m] = i / c.K;
+                        grow[g * k::kGroupMax + m] = i;
+                        gsg[i] = Ly.scale[0].empty() ? 1.0f : Ly.scale[0][e];
+                        gsu[i] = Ly.scale[1].empty() ? 1.0f : Ly.scale[1][e];
+                    }
+                    g0 += n_part[part];
+                }
+                g_win.ngroups += g0;
+                CU(cudaMemcpyAsync(g_win.pack_d[d], pk, 5632, cudaMemcpyHostToDevice, g_s));
+                const auto* pgb = (const uint8_t* const*) g_win.pack_d[d];
+                const int* pgn = (const int*) (g_win.pack_d[d] + 512);
+                const int* pgt = (const int*) (g_win.pack_d[d] + 768);
+                const int* pgr = (const int*) (g_win.pack_d[d] + 2816);
+                const float* psg = (const float*) (g_win.pack_d[d] + 4864);
+                const float* psu = (const float*) (g_win.pack_d[d] + 5120);
+                int gp = 0;
+                const int n_parts = n_part[1] ? 2 : 1;   // (a window whose misses are all in: the hits' part alone)
+                for (int part = 0; part < n_parts; ++part) {
+                    const int gc = n_part[part];
+                    if (!gc) continue;
+                    if (part) CU(cudaStreamWaitEvent(g_s, g_ep_cp[d], 0));
+                    const int go = gp;
+                    gp += gc;
+                    k::expert_limb_gate_g(pgb + go, pgn + go, pgt + (size_t) go * k::kGroupMax, pgr + (size_t) go * k::kGroupMax,
+                                          gc, Ly.eb[0], C, F, Wd.xq, T, psg, psu, c.gate_cap, c.up_cap, Wd.h16,
+                                          Wd.gu32, g_s, q8_limb);
+                    k::expert_limb_down_g(pgb + go, pgn + go, pgr + (size_t) go * k::kGroupMax, gc, S, Ly.eb[0] + Ly.eb[1],
+                                          C, F, Wd.h16, Wd.y32, Wd.gu32, g_s, q8_limb);
+                }
+                if (d == 1) {
+                    CU(cudaMemcpyPeerAsync(dev_work(0).y32 + (size_t) 64 * C, 0, Wd.y32, 1, (size_t) S * C * 4, g_s));
+                    CU(cudaEventRecord(g_ep_done, g_s));
+                }
+            }
+            use_dev(0);
+            CU(cudaStreamWaitEvent(g_s, g_ep_done, 0));
+            CU(cudaMemcpyAsync(g_win.cmb_d, g_win.cmb_h, 512, cudaMemcpyHostToDevice, g_s));
+            k::moe_combine_f32(W.y32, (const int*) g_win.cmb_d, (const float*) (g_win.cmb_d + 256), T, c.K, C,
+                               W.tmp, false, g_s);
+            if (wp) {
+                const double eb = (double) (Ly.eb[0] + Ly.eb[1] + Ly.eb[2]);
+                ++g_wp_visits;
+                g_wp_slots += S, g_wp_union += g_win.ngroups, g_wp_miss += g_win.nmiss;
+                g_wp_exp_bytes += eb * (double) g_win.ngroups;
+                g_wp_miss_bytes += eb * (double) g_win.nmiss;
+            }
+            t_exp += now() - te0;
+            wlap(g_wp[4]);
+            conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
+            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            wlap(g_wp[5]);
+            dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
+            continue;
+        }
         // The resident EP split: both devices hold every expert they own, so their slots are addressed on the device
         // and the picks never reach the host.  GPU 1 gets the 8 picks (64 B) and the input over, its own picks' slots
         // from its own table; the combine's rows and weights are built on GPU 0; no sync, no packs.
@@ -3714,6 +3871,13 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 }
             }
             g_pf.lap(g_pf.upload);
+            if (wp) {   // (IK2_WINPROF: this visit's slots, its distinct experts, and the ones copied in from host)
+                const double eb = (double) (Ly.eb[0] + Ly.eb[1] + Ly.eb[2]);
+                ++g_wp_visits;
+                g_wp_slots += S, g_wp_union += G, g_wp_miss += nw + n_jobs;
+                g_wp_exp_bytes += eb * G;
+                g_wp_miss_bytes += eb * (double) (nw + n_jobs);
+            }
             // one copy of the tables from pinned memory: [64] pointers, then tok, inv, sg, su, wt [64] each
             std::memcpy(pk, blob, S * sizeof(void*));
             std::memcpy(pk + 512, tk, S * 4);
@@ -3765,14 +3929,18 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             k::moe_combine_f32(W.y32, pid, pwt, T, c.K, C, W.tmp, false, g_s);
             g_pf.lap(g_pf.experts);
             t_exp += now() - te0;
+            wlap(g_wp[4]);
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
             g_pf.lap(g_pf.rest);
+            wlap(g_wp[5]);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
         run_prefill_moe(M, Ly, l, T, W.x16, top, w, W.r, W.h, W, EC, t_exp);
         g_pf.lap(g_pf.rest);
+        wlap(g_wp[4]);
+        wlap(g_wp[5]);
         dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
     }
     if (g_prof2 && T == 1) {   // (temporary: IK2_PROF2, the visits' attention sections)
@@ -3785,7 +3953,19 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
         g_p2_tokens += 1;
     }
+    if (g_prof2 && T > 1 && g_rec) {
+        CU(cudaStreamSynchronize(g_dev[0].s));
+        g_p2w_wall += now() - fw_t0;
+        for (int v = 0; v < c.n_visit; ++v)
+            for (int slot = 0; slot < 8; ++slot) {
+                float ms = 0.0f;
+                CU(cudaEventElapsedTime(&ms, g_p2ev[slot][v], g_p2ev[slot + 1][v]));
+                g_p2wacc[slot] += ms;
+            }
+        ++g_p2w_wins;
+    }
     run_head(M, T, all_logits, out_mode, nb, W.h, W, logits_out, argmax_out);
+    wlap(g_wp[6]);
 #undef W
 #undef EC
 }
@@ -4311,6 +4491,10 @@ int main(int argc, char** argv) {
     }
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
     g_prof2 = getenv("IK2_PROF2") && std::atoi(getenv("IK2_PROF2"));
+    g_winprof = getenv("IK2_WINPROF") && std::atoi(getenv("IK2_WINPROF"));
+    g_wp_host = getenv("IK2_WINPROF") && std::atoi(getenv("IK2_WINPROF")) > 1;
+    g_ep_win = !(getenv("IK2_EP_WIN") && !std::atoi(getenv("IK2_EP_WIN")));
+
 #if defined(STRATA_USE_HIP)
     // The fused prefill attention is mma.sync m16n8k16 (and Hopper's wgmma): no HIP kernel builds it, so the scalar
     // split kernels of attn_decode_f16_at are the path.  Asking for the fused one is refused rather than silently run.
@@ -5158,7 +5342,7 @@ int main(int argc, char** argv) {
     W.gu32 = work_alloc<float>(W.gu32_bytes / 4);
     W.qkv = W.gu32;
     W.lg16 = (uint16_t*) W.gu32;
-    W.y32 = work_alloc<float>(std::max<size_t>(64, T_buf) * C);
+    W.y32 = work_alloc<float>((std::max<size_t>(64, T_buf) + 64) * C);   // (+ a window's GPU 1 rows)
     if (g_tp)
         W.tp_h = work_alloc<uint16_t>(std::max<size_t>(64, S_buf) *
                                       c.F); // (one expert's tokens; the token path's <= 64 rows)
@@ -6207,9 +6391,27 @@ int main(int argc, char** argv) {
         for (int slot = 0; slot < 8; ++slot) std::printf(" %s %.2f", g_p2name[slot], g_p2acc[slot] / g_p2_tokens);
         std::printf("\n");
     }
+    if (g_prof2 && g_p2w_wins > 0) {
+        std::printf("attention sections of a window (ms/window over %ld windows):", g_p2w_wins);
+        double sum = 0;
+        for (int slot = 0; slot < 8; ++slot) sum += g_p2wacc[slot], std::printf(" %s %.2f", g_p2name[slot], g_p2wacc[slot] / g_p2w_wins);
+        std::printf(" | sum %.2f, the forward %.2f\n", sum / g_p2w_wins, g_p2w_wall * 1e3 / g_p2w_wins);
+    }
     if (g_prof)
         std::printf("profile (all calls): attention %.2f s, router %.2f s, uploads %.2f s, experts %.2f s, rest %.2f s\n",
                     g_pf.attn, g_pf.route, g_pf.upload, g_pf.experts, g_pf.rest);
+    if (g_winprof && g_wp_wins) {
+        double tot = 0;
+        std::printf("window profile (IK2_WINPROF%s, %ld windows, %ld visits): ms a window:",
+                    g_wp_host ? " host issue time" : "", g_wp_wins, g_wp_visits);
+        for (int i = 0; i < 7; ++i) tot += g_wp[i], std::printf(" %s %.2f", g_wpname[i], g_wp[i] * 1e3 / g_wp_wins);
+        std::printf(" | total %.2f\n  per visit: %ld slots, %.2f distinct experts, %.2f copied in from host; expert bytes"
+                    " read %.1f MB a window, %.1f MB of them over PCIe (host -> GPU 0)\n",
+                    tot * 1e3 / g_wp_wins, g_wp_slots / std::max(1L, g_wp_visits),
+                    (double) g_wp_union / std::max(1L, g_wp_visits),
+                    (double) g_wp_miss / std::max(1L, g_wp_visits),
+                    g_wp_exp_bytes / g_wp_wins / 1048576.0, g_wp_miss_bytes / g_wp_wins / 1048576.0);
+    }
     if (out.size() > 1)
         std::printf("generation: %d tokens in %.2f s (%.2f tok/s); cache %llu hits, %llu misses in it\n",
                     (int) out.size() - 1, gen_s, (out.size() - 1) / gen_s, (unsigned long long) (ec_sum([](ExpertCache& e) { return e.hits; }) - h0),
