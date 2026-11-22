@@ -156,11 +156,13 @@ products. Measured with `IK2_DRAFT_ADAPT=0` (every step a window), 63 tokens aft
 | 255 ids, C++ source | 5 | 2.25 | 36 of 112 (32 %) | 15.3 + 43.5 ms | 38.2 (44.4) |
 | 511 ids, README | 8 | 3.32 | 44 of 133 (33 %) | 17.2 + 58.6 ms | 43.8 (42.7) |
 | 511 ids, README | 5 | 3.00 | 42 of 84 (50 %) | 15.6 + 45.8 ms | **48.8 (42.7)** |
+| 32768 ids | 5 | 2.21 | 24 of 56 (43 %) | 20.9 + 78.0 ms | 22.4 (34.6) |
 
 The stream is the target's: the same 63 ids as plain decode on all three prompts except near ties (at 255: 159542 /
 152804 tie at 27.0161 / 27.0121; on the README prompt 197020 / 196978 early in the run - a window's summation order
-against a token's). At 32768 tokens the drafter's own attention grows (drafting ~21 ms) and so does the window's, so
-the width-5 window there is not in this table; the pre-change build measured 2.38 tokens a window and 14.8 tok/s. `IK2_DRAFT_WIDTH=3` is the best width on prose (where a
+against a token's). At 32768 tokens the window's attention reads 128x the keys it does at 255 while its drafting grows to ~21 ms, so the
+window costs 99 ms there and 32K is the one depth where the drafter is well behind plain decoding: the per-query
+attention kernel (8 rows, each its own pass over the keys) is what the deep-context window needs next. `IK2_DRAFT_WIDTH=3` is the best width on prose (where a
 window accepts 1 - 2 drafts), 5 on the README's shell tail, and 8 never pays (its third draft onwards is mostly
 rejected).
 
