@@ -2619,32 +2619,48 @@ template <bool Gate> __global__ void nv_input(const float* x, const uint16_t* h,
     pack_limbs<Gate>(x, h, K, packed, blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y, q8);
 }
 
-__device__ __forceinline__ float nv_limb_dot(const uint8_t* row, int sub, const NvInput& x) {
-    const uint8_t* b = row + 36 * (sub / 4);
-    const uint32_t* words = (const uint32_t*)(b + 4 + 8 * (sub % 4));
-    int hi = 0, lo = 0;
+// one sub-block of sixteen weights: its 16 four-bit codes as four ints of four signed bytes (a group's kernel expands
+// these once a sub-block and runs the members' dots on them), and the dots themselves
+__device__ __forceinline__ void nv_expand(const uint32_t* words, int val[4]) {
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const uint32_t nib = words[j / 2] >> (16 * (j % 2));
         const uint32_t pos = __byte_perm(0x03020100, 0x0c080604, nib);
         const uint32_t neg = __byte_perm(0xfdfeff00, 0xf4f8fafc, nib);
-        const int val = __byte_perm(pos, neg, 0x3210 | ((nib & 0x8888) >> 1));
-        hi = __dp4a(val, x.high[j], hi);
-        lo = __dp4a(val, x.low[j], lo);
+        val[j] = __byte_perm(pos, neg, 0x3210 | ((nib & 0x8888) >> 1));
     }
-    return float(128 * hi + lo) * x.scale * ue4m3(b[sub % 4]);
+}
+__device__ __forceinline__ int nv_dot_vals(const int val[4], const NvInput& x) {
+    int hi = 0, lo = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) hi = __dp4a(val[j], x.high[j], hi), lo = __dp4a(val[j], x.low[j], lo);
+    return 128 * hi + lo;
+}
+__device__ __forceinline__ int nv_dot_words(const uint32_t* words, const NvInput& x) {
+    int val[4];
+    nv_expand(words, val);
+    return nv_dot_vals(val, x);
+}
+__device__ __forceinline__ int q8_dot_words(const uint32_t* words, const NvInput& x) {
+    int hi = 0, lo = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t q = words[j];
+        hi = __dp4a(q, x.high[j], hi);
+        lo = __dp4a(q, x.low[j], lo);
+    }
+    return 128 * hi + lo;
+}
+__device__ __forceinline__ float nv_limb_dot(const uint8_t* row, int sub, const NvInput& x) {
+    const uint8_t* b = row + 36 * (sub / 4);
+    return float(nv_dot_words((const uint32_t*)(b + 4 + 8 * (sub % 4)), x)) * x.scale * ue4m3(b[sub % 4]);
 }
 __device__ __forceinline__ float q8_limb_dot(const uint8_t* row, int sub, const NvInput& x) {
     const uint8_t* block = row + (sub / 2) * 34;
     const uint16_t* q = (const uint16_t*)(block + 2 + (sub % 2) * 16);
-    int hi = 0, lo = 0;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const int four = (uint32_t)q[2 * j] | ((uint32_t)q[2 * j + 1] << 16);
-        hi = __dp4a(four, x.high[j], hi);
-        lo = __dp4a(four, x.low[j], lo);
-    }
-    return float(128 * hi + lo) * x.scale * h2f(*(const uint16_t*)block);
+    const uint32_t w[4] = {(uint32_t) q[0] | ((uint32_t) q[1] << 16), (uint32_t) q[2] | ((uint32_t) q[3] << 16),
+                           (uint32_t) q[4] | ((uint32_t) q[5] << 16), (uint32_t) q[6] | ((uint32_t) q[7] << 16)};
+    return float(q8_dot_words(w, x)) * x.scale * h2f(*(const uint16_t*) block);
 }
 
 template <bool Gate, bool Q8>
@@ -2674,6 +2690,80 @@ __global__ void nv_limb_mv(const uint8_t* const* blobs, const NvInput* packed, s
     } else {
         y[(size_t)slot * C + r] = a;
         y[(size_t)slot * C + r + 1] = b;
+    }
+}
+
+// One group's expert for every row of the window that picked it (a window's experts, T > 1): nv_limb_mv's dot, its
+// blocks read once for up to kGroupMax rows instead of once a row - group g's expert at blob[g] (a slot this device
+// does not own: null, and the group is skipped), its member j's packed input at row tok_g (gate: the token's x, one
+// pack a token) or row_g (down: the slot's h), and its output at row_g (h16 [row][F] F16 / y [row][C] F32).  The
+// per-row sums are nv_limb_mv's, lane striding and butterfly, so a row's result is bit-identical to that kernel's.
+template <bool Gate, bool Q8>
+__global__ void nv_limb_mv_g(const uint8_t* const* __restrict__ blobs, const int* __restrict__ n_g,
+                             const int* __restrict__ tok_g, const int* __restrict__ row_g,
+                             const NvInput* __restrict__ packed, size_t offset, int C, int F,
+                             const float* __restrict__ sg, const float* __restrict__ su, float gcap, float ucap,
+                             uint16_t* __restrict__ hidden, float* __restrict__ y) {
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, g = blockIdx.y;
+    const int cnt = n_g[g];
+    const uint8_t* bl = blobs[g];
+    if (!bl || cnt <= 0) return;
+    const int K = Gate ? C : F, N = Gate ? F : C;
+    const int r = (blockIdx.x * (blockDim.x / 32) + warp) * (Gate ? 1 : 2);
+    if (r >= N) return;
+    const int stride = Q8 ? K / 32 * 34 : K / 64 * 36;
+    const uint8_t* ra = bl + (Gate ? 0 : offset) + (size_t) r * stride;
+    const uint8_t* rb = ra + (Gate ? offset : stride);
+    int srow[kGroupMax];
+    float acc[kGroupMax][2];
+    for (int j = 0; j < cnt; ++j) {
+        srow[j] = Gate ? tok_g[g * kGroupMax + j] : row_g[g * kGroupMax + j];
+        acc[j][0] = acc[j][1] = 0.0f;
+    }
+    if (!Q8) {
+        for (int s = lane; s < K / 16; s += 32) {
+            const int blk = s >> 2, sub = s & 3;
+            const uint32_t* pa = (const uint32_t*) (ra + 36 * blk + 4 + 8 * sub);
+            const uint32_t* pb = (const uint32_t*) (rb + 36 * blk + 4 + 8 * sub);
+            const uint32_t wa[2] = {pa[0], pa[1]}, wb[2] = {pb[0], pb[1]};
+            const float fa = ue4m3(ra[36 * blk + sub]), fb = ue4m3(rb[36 * blk + sub]);
+            int va[4], vb[4];
+            nv_expand(wa, va), nv_expand(wb, vb);   // (once a sub-block, not once a member: the codes are shared)
+            for (int j = 0; j < cnt; ++j) {
+                const NvInput z = packed[(size_t) srow[j] * (K / 16) + s];
+                acc[j][0] += float(nv_dot_vals(va, z)) * z.scale * fa;
+                acc[j][1] += float(nv_dot_vals(vb, z)) * z.scale * fb;
+            }
+        }
+    } else {
+        for (int s = lane; s < K / 16; s += 32) {
+            const int blk = s >> 1, sub = s & 1;
+            const uint16_t* qa = (const uint16_t*) (ra + 34 * blk + 2 + 16 * sub);
+            const uint16_t* qb = (const uint16_t*) (rb + 34 * blk + 2 + 16 * sub);
+            uint32_t wa[4], wb[4];
+            for (int u = 0; u < 4; ++u)
+                wa[u] = (uint32_t) qa[2 * u] | ((uint32_t) qa[2 * u + 1] << 16),
+                wb[u] = (uint32_t) qb[2 * u] | ((uint32_t) qb[2 * u + 1] << 16);
+            const float fa = h2f(*(const uint16_t*) (ra + 34 * blk)), fb = h2f(*(const uint16_t*) (rb + 34 * blk));
+            for (int j = 0; j < cnt; ++j) {
+                const NvInput z = packed[(size_t) srow[j] * (K / 16) + s];
+                acc[j][0] += float(q8_dot_words(wa, z)) * z.scale * fa;
+                acc[j][1] += float(q8_dot_words(wb, z)) * z.scale * fb;
+            }
+        }
+    }
+    for (int j = 0; j < cnt; ++j) {
+        const float a = wsum(acc[j][0]), b = wsum(acc[j][1]);
+        if (lane) continue;
+        const int row = row_g[g * kGroupMax + j];
+        if (Gate) {
+            const float gg = a * (sg ? sg[row] : 1.f), uu = b * (su ? su[row] : 1.f);
+            hidden[(size_t) row * F + r] =
+                f2h(gcap * tanhf(gg / gcap) * (1.f / (1.f + expf(-gg))) * ucap * tanhf(uu / ucap));
+        } else {
+            y[(size_t) row * C + r] = a;
+            y[(size_t) row * C + r + 1] = b;
+        }
     }
 }
 
@@ -3786,9 +3876,8 @@ void attn_split_gqa_go(const float* q, const float* r, const KV* kc, const KV* v
             attn_split_gqa_kernel<KV, G, true, false><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0,
                                                                         qk_scale, proj, d_rel, extent, window, part);
         else
-            attn_split_gqa_kernel<KV, G, false, false><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk,
-                                                                         qpos0, qk_scale, proj, d_rel, extent, window,
-                                                                         part);
+            attn_split_gqa_kernel<KV, G, false, false><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0,
+                                                                         qk_scale, proj, d_rel, extent, window, part);
     }
 }
 
@@ -4987,7 +5076,40 @@ __global__ void __launch_bounds__(128) mv_f16_token_kernel(const uint16_t* __res
     if (lane == 0) y[row] = a;
 }
 
-// y [T][N] = W [N][K] (FP16) . x [T][K]: mv_f16_kernel a token a grid row
+// y [T][N] = W [N][K] (FP16) . x [T][K] (FP16), 2 <= T <= 8: a block 8 rows of W, a warp a row, its bytes read once
+// for all of the window's rows (the tokens' operands from the L1 / L2: a shared-memory tile of x, and a warp 4 rows of
+// W sharing it in registers, both measured slower here).  A lane takes the same 8-value chunks of its row in the same
+// order as mv_f16_token, so a row's sum is bit-identical to that kernel's.
+__global__ void __launch_bounds__(256) mv_f16_multi_kernel(const uint16_t* __restrict__ W, int N, int K, int T,
+                                                           const uint16_t* __restrict__ x, float* __restrict__ y,
+                                                           int y_ld) {
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= N) return;
+    const uint4* w = (const uint4*) (W + (size_t) row * K);
+    const int k8 = K >> 3;
+    float acc[8];
+#pragma unroll
+    for (int t = 0; t < 8; ++t) acc[t] = 0.0f;
+    for (int i = lane; i < k8; i += 32) {
+        const uint4 wv = __ldg(w + i);
+        const float w0 = h2f((uint16_t) wv.x), w1 = h2f((uint16_t) (wv.x >> 16));
+        const float w2 = h2f((uint16_t) wv.y), w3 = h2f((uint16_t) (wv.y >> 16));
+        const float w4 = h2f((uint16_t) wv.z), w5 = h2f((uint16_t) (wv.z >> 16));
+        const float w6 = h2f((uint16_t) wv.w), w7 = h2f((uint16_t) (wv.w >> 16));
+        for (int t = 0; t < T; ++t) {
+            const uint4 xv = *(const uint4*) (x + (size_t) t * K + 8 * i);
+            acc[t] += w0 * h2f((uint16_t) xv.x) + w1 * h2f((uint16_t) (xv.x >> 16)) + w2 * h2f((uint16_t) xv.y) +
+                      w3 * h2f((uint16_t) (xv.y >> 16)) + w4 * h2f((uint16_t) xv.z) + w5 * h2f((uint16_t) (xv.z >> 16)) +
+                      w6 * h2f((uint16_t) xv.w) + w7 * h2f((uint16_t) (xv.w >> 16));
+        }
+    }
+    for (int t = 0; t < T; ++t) {
+        const float a = wsum(acc[t]);
+        if (lane == 0) y[(size_t) t * y_ld + row] = a;
+    }
+}
+
+// y [T][N] = W [N][K] (FP16) . x [T][K] (FP16): mv_f16_kernel a token a grid row
 template <int WARPS>
 __global__ void mv_f16_rows_kernel(const uint16_t* __restrict__ W, int N, int K, const float* __restrict__ x, int x_ld,
                                    float* __restrict__ y, int y_ld) {
@@ -5925,6 +6047,34 @@ void expert_limb_mv(bool gate, const uint8_t* const* blob, size_t offset, int C,
     }
     check("nv_expert_limb");
 }
+// A window's experts by group (nv_limb_mv_g): gate | up of every row from one pack of the T tokens' x (F32), then
+// down from one pack of the S slots' h (F16).  G = the slots (S): groups past the last have n = 0 and return.
+void expert_limb_gate_g(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, size_t off_up,
+                        int C, int F, const float* x, int T, const float* sg, const float* su, float gcap, float ucap,
+                        uint16_t* h, void* scratch, cudaStream_t s, bool q8) {
+    auto* p = (NvInput*) scratch;
+    nv_input<true><<<dim3((C / 16 + 31) / 32, T), 32, 0, s>>>(x, nullptr, C, p, q8);
+    // (8 warps a block: the members' packed inputs are read once for eight rows of the expert, not four)
+    const dim3 gr((unsigned) ((F + 7) / 8), (unsigned) G);
+    if (q8)
+        nv_limb_mv_g<true, true><<<gr, 256, 0, s>>>(blob, n, tok, row, p, off_up, C, F, sg, su, gcap, ucap, h, nullptr);
+    else
+        nv_limb_mv_g<true, false><<<gr, 256, 0, s>>>(blob, n, tok, row, p, off_up, C, F, sg, su, gcap, ucap, h, nullptr);
+    check("expert_limb_gate_g");
+}
+void expert_limb_down_g(const uint8_t* const* blob, const int* n, const int* row, int G, int S, size_t off_down, int C,
+                        int F, const uint16_t* h, float* y, void* scratch, cudaStream_t s, bool q8) {
+    auto* p = (NvInput*) scratch;
+    nv_input<false><<<dim3((F / 16 + 31) / 32, S), 32, 0, s>>>(nullptr, h, F, p, q8);
+    const dim3 gr((unsigned) ((C + 15) / 16), (unsigned) G);
+    if (q8)
+        nv_limb_mv_g<false, true><<<gr, 256, 0, s>>>(blob, n, nullptr, row, p, off_down, C, F, nullptr, nullptr, 0, 0,
+                                                     nullptr, y);
+    else
+        nv_limb_mv_g<false, false><<<gr, 256, 0, s>>>(blob, n, nullptr, row, p, off_down, C, F, nullptr, nullptr, 0, 0,
+                                                      nullptr, y);
+    check("expert_limb_down_g");
+}
 __global__ void ep_pick_table_kernel(const int* top, const float* w, const uint8_t* own, int l, int E, int S, int d,
                                      const uint8_t* const* tab, const float* sg, const float* su, const float* sc2,
                                      const uint8_t** blob, float* sg_out, float* su_out, int* rows, float* wts) {
@@ -6584,6 +6734,11 @@ void mv_f16_token(const uint16_t* W, int N, int K, const uint16_t* x, float* y, 
     if (N <= 0) return;
     mv_f16_token_kernel<<<(unsigned) ((N + 3) / 4), 128, 0, s>>>(W, N, K, x, y);
     check("mv_f16_token");
+}
+void mv_f16_multi(const uint16_t* W, int N, int K, int T, const uint16_t* x, float* y, int y_ld, cudaStream_t s) {
+    if (N <= 0 || T <= 0) return;
+    mv_f16_multi_kernel<<<(unsigned) ((N + 7) / 8), 256, 0, s>>>(W, N, K, T, x, y, y_ld);
+    check("mv_f16_multi");
 }
 void f16_limbs_rows(const float* x, int T, int C, uint16_t* out, cudaStream_t s) {
     if (T <= 0) return;

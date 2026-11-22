@@ -193,6 +193,13 @@ constexpr int kEpRows = 8;
 /// One GPU's half of a token's picks, from the device only: the picks' resident slots on this device (null for the ones
 /// it does not own), their gate/up scales and - GPU 0's - the combine's rows (its own picks at 0 .. kEpRows - 1, GPU 1's
 /// at kEpRows ..) and weights.  own: ep_owner [n_layer][E]; tab: this device's [E] slots; sg/su/sc2: its [E] scales.
+/// A window's group (group_route's tables) of one expert for all of its rows, the limb (dp4a) path: gate | up of x
+/// [T][C] (F32, a pack a token) to h [row][F] F16, or down of h [S][F] F16 (a pack a slot) to y [row][C] F32.
+void expert_limb_gate_g(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, size_t off_up,
+                        int C, int F, const float* x, int T, const float* sg, const float* su, float gcap, float ucap,
+                        uint16_t* h, void* scratch, cudaStream_t s, bool q8);
+void expert_limb_down_g(const uint8_t* const* blob, const int* n, const int* row, int G, int S, size_t off_down, int C,
+                        int F, const uint16_t* h, float* y, void* scratch, cudaStream_t s, bool q8);
 void ep_pick_table(const int* top, const float* w, const uint8_t* own, int l, int E, int S, int d,
                    const uint8_t* const* tab, const float* sg, const float* su, const float* sc2,
                    const uint8_t** blob, float* sg_out, float* su_out, int* rows, float* wts, cudaStream_t s);
@@ -468,6 +475,9 @@ void mv_f16_rows(const uint16_t* W, int N, int K, const float* x, int x_ld, int 
 /// y [N] = W [N][K] (FP16) . x [K] (FP16), F32 sums: a warp a row, 16-byte loads (K a multiple of 8, W and x 16-byte
 /// aligned).  A one-token dense product: the same bytes hipBLAS' GEMM with T = 1 reads at a fraction of the speed.
 void mv_f16_token(const uint16_t* W, int N, int K, const uint16_t* x, float* y, cudaStream_t s);
+/// The same for a window of 2 .. 8 tokens: the weights of a row read once for all of them (a block 8 rows of W, the
+/// tokens' rows in its shared memory), y [T][y_ld].
+void mv_f16_multi(const uint16_t* W, int N, int K, int T, const uint16_t* x, float* y, int y_ld, cudaStream_t s);
 /// x [T][C] as two FP16 limbs a token: out [T][2][C] (hi, lo).
 void f16_limbs_rows(const float* x, int T, int C, uint16_t* out, cudaStream_t s);
 /// route()'s picks of a window (S = T K <= 64 slots) grouped by expert on the device: blob [S], n [S] (0 past the

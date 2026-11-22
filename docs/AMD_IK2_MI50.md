@@ -114,25 +114,75 @@ sha256 `7c3b6513...a1d2`). The repaired `/disk/models/mtp.safetensors` is the on
 (`/disk/models/mtp-fresh/` holds just a download lock, a re-download is still blocked; the corrupt original is
 `/disk/models/mtp.safetensors.hole-20261122`), so `--draft` must be pointed at that file and nothing else.
 
-After the repair, at 255 / 512 / 32768 tokens (CLI, `--gen`, `IK2_DRAFT_WIDTH=5` unless noted):
+### The verify window: an expert read once, both GPUs, a dense row a token
 
-| prompt | windows | tokens a window | drafts accepted | dr[0] | drafting + verifying | tok/s (plain) |
-|---|---|---|---|---|---|---|
-| 255, width 8 | 27 | **2.33** | 43 of 189 (23 %) | 59 % | 16.9 + 197.1 ms | 10.9 (43.9) |
-| 255 | 28 | 2.25 | 27 of 112 (24 %) | 61 % | 15.4 + 147.4 ms | 13.8 (43.9) |
-| 512 (README tail), width 8 | 18 | **3.50** | 45 of 126 (36 %) | 72 % | 17.2 + 195.7 ms | 16.4 (43.8) |
-| 512 | 14 | 2.21 | 13 of 56 (23 %) | 57 % | 15.7 + 152.2 ms | 13.2 (43.8) |
-| 32768 | 13 | 2.38 | 14 of 52 (27 %) | 62 % | 21.0 + 140.5 ms | 14.8 (34.5) |
+With the checkpoint whole the proposals continue the text, but the window cost 147 - 197 ms: about a plain token a row,
+because `forward()` runs all 48 visits for the window's rows and every row ran the whole decode path. `IK2_WINPROF=1`
+(a stream sync a section; `IK2_PROF2=1` gives the attention sections) put a width-8 window at 255 tokens at **209 ms of
+experts out of 286** - 5.7 GB of expert bytes, 1.5 GB of them copied into GPU 0 from host memory at ~21 GB/s because a
+window's picks (~40 of 128 a layer, 29.6 distinct after grouping) are split over both GPUs' caches by `ep_owner` while
+the `T > 1` path only ever looked in GPU 0's - then 59 ms of attention, 6 ms of routing round trips, 4 ms of head and
+1 ms of convs.
 
-The proposals continue the text (a window that accepts all four: `147403 62 146312 146024`), and the acceptance
-tracks the text: the README's shell-command tail is high entropy. The greedy stream is the target's: identical to
-plain decode at 32768 and to position 44 at 255, where 159542 / 152804 tie at 27.0161 / 27.0121 - a window's
-different summation order; `IK2_DRAFT_WIDTH=2` reproduces the plain stream exactly. `IK2_DRAFT_CTX=2048` changes
-nothing at these depths (both caches hold the whole context).
+The window now takes four other paths. They are additive: `T == 1`, the prefill paths and the CUDA paths are untouched.
 
-What is left is the window's cost, not its correctness: 147 - 197 ms a window against 22.6 ms a plain token, i.e.
-about a plain token a row, because `forward()` runs all 48 visits for the window's rows. A scalar block attention
-(the CUDA `attn_block_mma`'s job) is what a 2 - 3x faster window needs.
+* **An expert read once for all of its rows.** `nv_limb_mv_g` runs the limb (`__dp4a`) dot that a token's picks use
+  (`nv_limb_mv`), a group's expert read once for the up to 8 rows that picked it instead of once a row, its block
+  codes expanded once a sub-block for the whole group. The per-row sums are the same lane striding and butterfly, so a
+  row's expert output is bit-identical to a token's.
+* **Both GPUs for the window.** The window's slots are split by `ep_owner`; each device groups the slots it owns by
+  expert on the host (the routing round trip the window makes anyway), looks each up in its own cache (a miss copied
+  in on that device's copy stream, the hits' kernels first), runs gate | up | down on its own experts, and GPU 1's
+  `y [S][C]` comes back to GPU 0 for the combine (in `y32` past GPU 0's rows). In the steady state the window's misses
+  are 0.11 a visit: 25 MB a window over PCIe against 1.5 GB before.
+* **A window's dense products.** `mv_f16_multi`: a warp four rows of the matrix, each lane's 8-value chunk of `x`
+  shared by them; hipBLAS' GEMM read the same weights at 45 GB/s at 2 .. 8 rows (37 ms of a window's projections
+  against 4.3 ms of dense work a token), this at 195. The 8-value order is `mv_f16_token`'s, so a row's sum is
+  bit-identical to one token's GEMV.
+* **Nothing else pays yet.** The attention kernel stays per query: NQ of a window's queries a block (the K / V rows
+  read once for them) measured *slower* (4 queries a block: 88.6 ms a window against 55.2, register pressure and the
+  per-query softmax), and was dropped. The per-layer routing round trip stays: the expert caches are host-side, so the
+  picks must come to the host.
+
+`IK2_EP_WIN=0` restores the previous window (the scalar row kernels, GPU 0's cache), `IK2_GEMV_WIN=0` the hipBLAS dense
+products. Measured with `IK2_DRAFT_ADAPT=0` (every step a window), 63 tokens after the prompt, two cards, FP8 KV:
+
+| prompt | width | tokens a window | drafts accepted | drafting + verifying | tok/s (plain) |
+|---|---|---|---|---|---|
+| 255 ids | 8 | 2.25 | 37 of 196 (19 %) | 16.9 + 56.7 ms | 30.6 (43.9) |
+| 255 ids | 5 | 2.25 | 35 of 112 (31 %) | 15.4 + 42.9 ms | 38.6 (43.9) |
+| 255 ids | 3 | 2.10 | 34 of 60 (57 %) | 14.3 + 35.0 ms | 42.6 (43.9) |
+| 255 ids, C++ source | 8 | 1.97 | 32 of 224 (14 %) | 16.9 + 54.5 ms | 27.6 (44.4) |
+| 255 ids, C++ source | 5 | 2.25 | 36 of 112 (32 %) | 15.3 + 43.5 ms | 38.2 (44.4) |
+| 511 ids, README | 8 | 3.32 | 44 of 133 (33 %) | 17.2 + 58.6 ms | 43.8 (42.7) |
+| 511 ids, README | 5 | 3.00 | 42 of 84 (50 %) | 15.6 + 45.8 ms | **48.8 (42.7)** |
+
+The stream is the target's: the same 63 ids as plain decode on all three prompts except near ties (at 255: 159542 /
+152804 tie at 27.0161 / 27.0121; on the README prompt 197020 / 196978 early in the run - a window's summation order
+against a token's). At 32768 tokens the drafter's own attention grows (drafting ~21 ms) and so does the window's, so
+the width-5 window there is not in this table; the pre-change build measured 2.38 tokens a window and 14.8 tok/s. `IK2_DRAFT_WIDTH=3` is the best width on prose (where a
+window accepts 1 - 2 drafts), 5 on the README's shell tail, and 8 never pays (its third draft onwards is mostly
+rejected).
+
+A width-8 window at 255 tokens, section by section (`IK2_WINPROF=1`, 8 windows, ms a window):
+
+| section | ms | of it |
+|---|---|---|
+| setup (the loop's messages, bank copies, taps) | 1.0 | |
+| attention block | 23.0 | projections 9.7, gate + o_proj + convs 5.3, the norms 3.5, the attention kernel 3.1, the MoE input 3.1, the K / V convs 1.8, prep + messages 1.4 |
+| the routing round trip (its D2H sync) | 4.0 | |
+| experts (both GPUs, 6.47 GB a window) | 22.0 | 29.6 distinct a visit, 0.11 copied in, 297 GB/s over the two devices |
+| head (8 rows x 200058) | 3.4 | |
+| convs + residual | 1.2 | |
+| total | 57.9 | (56.7 ms a window measured without the profiler) |
+
+What is left in the window, in the order the profile puts it: the experts' 297 GB/s is one device's rate (each of the
+two devices reads ~3.2 GB in the 22 ms, i.e. 147 GB/s against `nv_limb_mv`'s 294 - the grouped kernel's extra dots are
+not free, and the two devices' kernels do not add up); the dense GEMV reads 195 GB/s against `mv_f16_token`'s 840 (a
+register-blocked variant and a shared-memory tile of `x` both measured slower and were dropped); the routing's 48 D2H
+syncs (4 ms) need device-side expert tables, which this 16 GiB machine cannot hold (`g_ep_split` is off here: GPU 0's
+cache holds 1367 slots for the ~1536 experts it owns). A CUDA graph a window size is the other 2 - 3x, and capturing a
+window across both devices is still out of scope.
 
 ## Disabled on gfx906
 
@@ -143,11 +193,12 @@ about a plain token a row, because `forward()` runs all 48 visits for the window
   run instead. `IK2_FLASH=1`, `IK2_ATTN_MMA=1`, `IK2_BLOCK=1`, `IK2_EXPERT_MMA=1`
   are refused at startup rather than run.
 * **The block path** (a verify window's attention, `attn_block_mma`) and CUDA graphs: off (`IK2_GRAPH=0`).
-* **The drafter through the general prompt path** (`--draft`): correct on two cards with EP after the checkpoint
-  repair above (its proposals continue the text, 2.2 - 3.5 tokens a window), but a verify window runs the whole
-  48-visit loop - the block path is mma.sync, compiled out here - so a window of B costs about B plain tokens and
-  the result is slower than plain decoding (13.8 tok/s against 43.9 at 255 tokens). Off by default; the
-  sections above and below it describe the state and what is left.
+* **The drafter through the general prompt path** (`--draft`): correct with EP (2.0 - 3.5 tokens a window) and its
+  verify window now runs the grouped limb experts over both GPUs' caches and `mv_f16_multi`, which took a width-8
+  window at 255 tokens from 286 ms (profile: 209 of it experts) to 58 ms. It still pays only where the drafter is
+  accepted: the README's shell tail gives 48.8 tok/s against 42.7 plain at width 5, while prose and C++ source are at
+  or below plain decoding (255 ids: 42.6 tok/s at width 3 against 43.9). Off by default, and `--serve` has no spec
+  path for it (its `spec_step` is the block path's, which this build does not have).
 * **Vision**: the mmproj file exists but the vision encoder is not built for HIP here.
 
 ## Cold start
@@ -181,8 +232,12 @@ warm; the per-GPU fill is 0.6 s; `READY` follows. Keep the GGUF page-cached for 
    or `exp2f` (2 instructions) if a last-bit change is acceptable.
 4. Planar Q8 dense (`IK2_DENSE=q8`) works with EP and halves the dense bytes a token reads (42.9 → 43.2
    tok/s) but a prefill chunk then dequantizes every projection per pass (421 → 209 tok/s): opt-in only.
-5. The drafter's verify window: the scalar block attention above (a window costs a plain token a row
-   through `forward()`), and a sampler-aware accept rule before it can reach the server.
+5. The drafter's verify window (after the work above: 58 ms at width 8, 255 tokens, against 286 before it): the
+   experts' 297 GB/s over the two devices is one device's rate (147 GB/s a device against `nv_limb_mv`'s 294), the
+   window's dense GEMV reads 195 GB/s against `mv_f16_token`'s 840 (a shared-memory tile of `x` and a warp 4 rows of
+   the matrix both measured slower and were dropped), and the routing's 48 D2H syncs (4 ms) need device-side expert
+   tables, which need every owned expert resident - `g_ep_split` is off here. A CUDA graph a window size is the other
+   2 - 3x, and a sampler-aware accept rule comes before the server can have one.
 6. The limb (`__dp4a`) expert kernels are bandwidth-bound where they read: kernel-only **294 GB/s** (gate+up 332,
    down 240; **0.1217 ms** an 8-expert layer-visit = **5.84 ms a token** at 48 visits; the floor at the memory's
    890 GB/s is 0.0403 ms). The non-invasive variants tried - preloading and unrolling, row pairs, a batched
