@@ -546,6 +546,22 @@ failures, plain unchanged (44.04 tok/s, `5608e98aa117`, same session, its path u
 tok/s with a warm page cache (344 on a cold one right after the tests - its path is untouched either way). Twelve clean runs alone are not conclusive at a 1-in-12 rate (p ~ 0.35); the change is
 justified as well by being strictly conservative - it adds an ordering and removes none.
 
+### The event sweep's two other victims, and the serve check
+
+The commit that introduced the window's per-visit copy events (`a7a9a0f`) renamed them in one sweep and took two
+branches with it: the tensor-parallel path and the single-token EP path ended up waiting on `g_win.cp[d][vis]`, an
+event only the draft-window branch records - so `--serve` with a drafter loaded (which decodes at T = 1, because
+`spec_on` needs `g_fast`, set only on the single-GPU path) died on its first token with `invalid resource handle`,
+and then hung in `exit()`. Restored: each of those branches waits on `g_ep_cp[d]`, the event it records a few lines
+above. The audit of every wait against its branch's record: tensor-parallel `g_ep_cp[d]` / `g_ep_done`; the window
+`g_win.cp[d][vis]` / `g_win.done[vis]`; the single-token EP `g_ep_cp[d]` / `g_ep_done`; the canonical-hits path
+`g_ep_done`. Verified through the real server (2 cards, `--draft /disk/models/mtp.safetensors`, `IK2_EP=1 IK2_KV=fp8
+IK2_DENSE=q8 IK2_DRAFT_CTX=65536`, `--max-context 262144 --cache-gb 14`): two non-streaming requests and one
+streaming one, 41 - 46 tok/s on the answers (plain decode: through `--serve` the drafter is resident but idle on
+this build, since `spec_on = drafter && g_fast && g_block` and `g_fast` is only set on the single-GPU path - wiring
+the window into the serve loop is still open work), clean stop; and the CLI window 12 of 12 identical again after
+the change (`5608e98aa117` twelve times, 47.90 - 48.99 tok/s, tests 357 checks 0 failures).
+
 ## Disabled on gfx906
 
 * **Tensor-core attention and experts** (`mma.sync m16n8k16`, Hopper `wgmma`, `cp.async`, `ldmatrix`,

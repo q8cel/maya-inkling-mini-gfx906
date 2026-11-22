@@ -3441,7 +3441,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 tp_part(Ly, d, 0, o, b0g);
                 for (int part = 0; part < 2; ++part) {
                     const int p0 = part ? nhit : 0, m = part ? nmis : nhit;
-                    if (part) CU(cudaStreamWaitEvent(g_s, g_win.cp[d][vis], 0));
+                    if (part) CU(cudaStreamWaitEvent(g_s, g_ep_cp[d], 0));
                     if (!m) continue;
                     k::experts_gate_up_swiglu_rows(pb + p0, ptk + p0, m, Ly.ty[0], Ly.ty[1], b0g, Wd.xq, C, Fd,
                                                    psg + p0, psu + p0, c.gate_cap, c.up_cap, Wd.tp_h + (size_t) d * Fd,
@@ -3703,7 +3703,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 if (d == 1) CU(cudaMemcpyPeerAsync(Wd.xq, 1, dev_work(0).xq, 0, (size_t) C * 4, g_s));
                 for (int part = 0; part < 2; ++part) {
                     const int p0 = part ? nhit : 0, m = part ? nmis : nhit;
-                    if (part) CU(cudaStreamWaitEvent(g_s, g_win.cp[d][vis], 0));
+                    if (part) CU(cudaStreamWaitEvent(g_s, g_ep_cp[d], 0));
                     if (!m) continue;
                     if (limb) {   // (the limb (dp4a) kernels: the input as two 8-bit limbs, one launch a phase)
                         k::expert_limb_mv(true, pb + p0, Ly.eb[0], C, F, m, Wd.xq, Wd.h16 + (size_t) p0 * F, nullptr,
