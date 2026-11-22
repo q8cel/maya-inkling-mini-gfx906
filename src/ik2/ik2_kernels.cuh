@@ -292,6 +292,11 @@ void attn_decode_fp8(const float* q, const float* r, const float* sink, const ui
 /// kernel (HIP only: the CUDA build has no GQA path and this is a no-op there).  The tests use it to compare the
 /// two on the same inputs.
 void attn_gqa_mode(int mode);
+/// A window's attention four keys in flight (the per-key online softmax's chain halved): off restores the per-key
+/// kernel, `nk` is the first key count that takes it.  Only nq >= 2 (a window's queries); a token keeps the per-key
+/// kernel, whose partials are the scalar path's bit for bit.  IK2_ATTN_2LVL / IK2_ATTN_2LVL_NK, IK2_ATTN_KF=2 the
+/// two-key group; the tests use this to compare the groupings on one input.
+void attn_2lvl_mode(bool on, int nk);
 
 /// Unwrap nk KV rows starting at k0 from FP8 ring buffer into contiguous FP16 [nk, KD] scaled by k_inv_scale / v_inv_scale.
 void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk, int KD,

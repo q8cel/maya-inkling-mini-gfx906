@@ -2275,6 +2275,101 @@ void test_attn_gqa() {
 #endif
 }
 
+// A window's attention, four keys in flight (attn_split_gqa4_kernel), against the per-key kernel on the same K / V /
+// queries: same split, same four-warp merge, same H*P*130 partials, so the two differ only by the grouping of each
+// warp's keys (one max and one rescale a group, the value terms summed pairwise).  Pins that difference for the
+// window's shapes (nq = 5, 7, 8; a full cache, a sliding ring with a mask, an FP16 cache), a key count that is not a
+// multiple of the group (the tail), and the two-key group the register fallback uses.
+void test_attn_two_level() {
+#if defined(STRATA_USE_HIP)
+    const int D = 128, d_rel = 16, extent = 1024, ctx = 4096;
+    const float k_inv = 1.0f / 16.0f, v_inv = 1.0f / 32.0f, scale = 1.0f / std::sqrt(128.0f);
+    struct Case {
+        int H, KV, k0, nk, nq, kv_cap, window;
+        const char* name;
+    };
+    const Case cases[] = {
+        {24, 8, 0, 2500, 8, 0, 1 << 30, "attn 2lvl / per-key: H24 KV8 8 queries full 2500"},
+        {24, 8, 0, 2501, 5, 0, 1 << 30, "attn 2lvl / per-key: H24 KV8 5 queries 2501 (tail)"},
+        {24, 8, 1477, 1024, 5, 1056, 1024, "attn 2lvl / per-key: H24 KV8 ring 1056 masked"},
+        {48, 8, 1477, 1031, 6, 1056, 1024, "attn 2lvl / per-key: H48 KV8 GQA 6 masked ring"},
+        {24, 8, 0, 3000, 7, 0, 1 << 30, "attn 2lvl / per-key: H24 KV8 7 queries full 3000"},
+    };
+    for (const Case& c : cases) {
+        std::vector<uint8_t> kc_lin((size_t) ctx * c.KV * D), vc_lin((size_t) ctx * c.KV * D);
+        for (size_t i = 0; i < kc_lin.size(); ++i) {
+            uint8_t bk = (uint8_t) (rng() & 0xFFu), bv = (uint8_t) (rng() & 0xFFu);
+            if ((bk & 0x7F) >= 0x7E) bk = (bk & 0x80u) | 0x60u;
+            if ((bv & 0x7F) >= 0x7E) bv = (bv & 0x80u) | 0x60u;
+            kc_lin[i] = bk, vc_lin[i] = bv;
+        }
+        std::vector<uint8_t> kc = kc_lin, vc = vc_lin;
+        if (c.kv_cap > 0) {
+            kc.assign((size_t) c.kv_cap * c.KV * D, 0), vc.assign(kc.size(), 0);
+            for (int pos = c.k0; pos < c.k0 + c.nk; ++pos) {
+                const int slot = pos % c.kv_cap;
+                std::memcpy(&kc[(size_t) slot * c.KV * D], &kc_lin[(size_t) pos * c.KV * D], (size_t) c.KV * D);
+                std::memcpy(&vc[(size_t) slot * c.KV * D], &vc_lin[(size_t) pos * c.KV * D], (size_t) c.KV * D);
+            }
+        }
+        auto q = fvec((size_t) c.nq * c.H * D, 3.0f), r = fvec((size_t) c.nq * c.H * d_rel, 2.0f),
+             sink = fvec((size_t) c.nq * c.H, 3.0f), proj = fvec((size_t) extent * d_rel);
+        uint8_t* dk = dev(kc);
+        uint8_t* dv = dev(vc);
+        float *dq = dev(q), *dr = dev(r), *ds = dev(sink), *dp = dev(proj);
+        float* scratch = dev_n<float>((size_t) c.nq * c.H * (ctx + 128 * 130));
+        float* o1 = dev_n<float>((size_t) c.nq * c.H * D);
+        float* o2 = dev_n<float>((size_t) c.nq * c.H * D);
+        auto run = [&](bool two_level, float* out) {
+            k::attn_2lvl_mode(two_level, 0);
+            k::attn_multi_fp8(dq, dr, ds, dk, dv, c.kv_cap, c.nq, c.H, c.KV, c.k0, c.nk, c.k0 + c.nk - c.nq,
+                              scale * k_inv, v_inv, dp, d_rel, extent, c.window, scratch, out, 0);
+        };
+        run(false, o1);
+        run(true, o2);
+        const auto got = host(o2, (size_t) c.nq * c.H * D);
+        const auto want = host(o1, (size_t) c.nq * c.H * D);
+        expect(c.name, got, std::vector<double>(want.begin(), want.end()), 1e-5, 2e-5);
+        for (float* p : {dq, dr, ds, dp, scratch, o1, o2})
+            cudaFree(p);
+        cudaFree(dk), cudaFree(dv);
+    }
+    {   // the FP16 cache, and the two-key group the register-pressure fallback uses
+        const int H = 24, KV = 8, nk = 2200, nq = 5;
+        auto kf = fvec((size_t) nk * KV * D), vf = fvec((size_t) nk * KV * D);
+        std::vector<uint16_t> kh(kf.size()), vh(vf.size());
+        for (size_t i = 0; i < kf.size(); ++i) kh[i] = f2h_host(kf[i]), vh[i] = f2h_host(vf[i]);
+        auto q = fvec((size_t) nq * H * D, 3.0f), r = fvec((size_t) nq * H * d_rel, 2.0f),
+             sink = fvec((size_t) nq * H, 3.0f), proj = fvec((size_t) extent * d_rel);
+        uint16_t* dk = dev(kh);
+        uint16_t* dv = dev(vh);
+        float *dq = dev(q), *dr = dev(r), *ds = dev(sink), *dp = dev(proj);
+        float* scratch = dev_n<float>((size_t) nq * H * (4096 + 128 * 130));
+        float* o1 = dev_n<float>((size_t) nq * H * D);
+        float* o2 = dev_n<float>((size_t) nq * H * D);
+        auto run = [&](bool two_level, float* out) {
+            k::attn_2lvl_mode(two_level, 0);
+            k::attn_multi_f16(dq, dr, ds, dk, dv, 0, nq, H, KV, 0, nk, nk - nq, scale, dp, d_rel, extent, 1 << 30,
+                              scratch, out, 0);
+        };
+        run(false, o1);
+        setenv("IK2_ATTN_KF", "2", 1);
+        run(true, o2);
+        unsetenv("IK2_ATTN_KF");
+        const auto got = host(o2, (size_t) nq * H * D);
+        const auto want = host(o1, (size_t) nq * H * D);
+        expect("attn 2lvl / per-key: H24 KV8 FP16 cache, 2 keys a group", got,
+               std::vector<double>(want.begin(), want.end()), 1e-5, 2e-5);
+        for (float* p : {dq, dr, ds, dp, scratch, o1, o2})
+            cudaFree(p);
+        cudaFree(dk), cudaFree(dv);
+    }
+    k::attn_2lvl_mode(false, 2048);   // (the build's default: off; the kernel is opt-in, IK2_ATTN_2LVL=1)
+#else
+    std::printf("skipped on CUDA: test_attn_two_level (no GQA split kernel)\n");
+#endif
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // the drafter's own ops (src/ik2/ik2_draft.cu's pipeline: mix_rms, draft_attn, rope_neox, rnn_inputs, rnn_gates,
 // to_bf16, silu_mul_bf16).  Nothing else calls them, so without these a port's bug in one of them shows up only as
@@ -3044,6 +3139,8 @@ int main() {
     test_q8_verify_tile();
 #endif
     test_attn_gqa();   // (last: its random K / V leaves the others' data as it was)
+    test_attn_two_level();
+    test_attn_two_level();
     test_drafter_ops();
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;

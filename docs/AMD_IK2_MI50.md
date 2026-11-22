@@ -291,6 +291,44 @@ syncs (4 ms) need device-side expert tables, which this 16 GiB machine cannot ho
 cache holds 1367 slots for the ~1536 experts it owns). A CUDA graph a window size is the other 2 - 3x, and capturing a
 window across both devices is still out of scope.
 
+### The window's deep-context attention: the chain is not what limits it
+
+At 32768 tokens the window's verify was 78.1 ms on a busy box and 62.4 - 66.0 on an idle one. Its sections there
+(`IK2_WINPROF=1 IK2_PROF2=1`, width 5, 13 windows, ms a window): setup 1.5, **attention block 37.4** - of which the
+attention kernel **20.9**, projections 6.8, gate + o_proj + convs 4.1, the norms 3.5, the MoE input 3.1, the K / V
+convs 1.5, prep 0.5 - experts 16.4, routing 3.4, head 2.5, convs 1.1; total 65.4. So the kernel is the largest single
+section and the only one where a softmax's structure can matter.
+
+The per-key online softmax is a chain: load K -> four-term dot -> a five-step xor butterfly -> (the bias's second
+butterfly) -> max -> two `expf` (13 instructions each) -> five FMAs that rescale `(m, s, o)`. `attn_split_gqa4_kernel`
+groups **four of a warp's keys** (`j, j+4, j+8, j+12` of the stride-4 set it already had): four K loads together, four
+independent dots and butterflies, one max over the four, **one** rescale of `(m, s, o)`, four independent `expf`, and
+the value terms summed pairwise; keys left over run through the single-key body, and the split, the four-warp merge and
+the `H*P*130` partials are untouched. `IK2_ATTN_2LVL=1` turns it on (default **off**), `IK2_ATTN_2LVL_NK` the first key
+count (2048), `IK2_ATTN_KF=2` the two-key group, and `attn_2lvl_mode()` is what `test_attn_two_level` compares. Only a
+window's queries (nq >= 2): a token keeps the per-key kernel, whose partials are the scalar path's bit for bit.
+
+It is slower, at both group sizes, and the 32K window is where it should have paid:
+
+| 32768 ids, width 5, `IK2_DRAFT_ADAPT=0`, 13 - 14 steps | verifying | tok/s |
+|---|---|---|
+| per-key (today's kernel) | **62.4 ms** | 28.6 |
+| two keys a group (KF 2) | 64.9 | 27.8 |
+| four keys a group (KF 4) | 82.6 | 21.4 |
+
+KF = 4 (the design) loses 32 %: with `G = 3` heads it holds four K rows, four V rows, twelve logits and twelve betas
+live at once (~95 - 105 registers) and spills. KF = 2 is a wash (64.9 against 62.4, and the same accepted stream as the
+per-key run), which is the informative number: halving the number of rescales per key changes nothing, so at
+`nk / P = 256` keys a warp the kernel is not chain-bound - the latency is already hidden by the blocks in flight (the
+K / V stream is 65 GB/s, thirteen times below the memory's 890, and adding keys a warp does not move it). The lever
+for this kernel is therefore *fewer bytes or fewer instructions a key*, not a shorter chain: the rejected cross-query
+sharing designs (86.0 / 92.5 ms) and this one bracket the space, and the block-shaped answer (the CUDA path's
+`attn_block_mma`, and a two-level softmax on top of it) needs tensor cores this build does not have.
+
+The four-key kernel stays in the tree, off by default and covered by `test_attn_two_level` (full, sliding ring with a
+mask, GQA 6, an FP16 cache, a tail key count, the KF = 2 group; 13 checks, 1e-5 relative against the per-key kernel), so
+that the next attempt at this kernel starts from a measured negative rather than a guess.
+
 ## Disabled on gfx906
 
 * **Tensor-core attention and experts** (`mma.sync m16n8k16`, Hopper `wgmma`, `cp.async`, `ldmatrix`,

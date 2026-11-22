@@ -17,6 +17,19 @@ namespace ik2::k {
 // attn_split_kernel, 1 the GQA kernel)
 int g_attn_gqa = -1;
 void attn_gqa_mode(int mode) { g_attn_gqa = mode; }
+// A window's attention, four keys in flight (IK2_ATTN_2LVL=0 off, IK2_ATTN_2LVL_NK the first key count it takes): the
+// per-key online softmax is a chain on (m, s, o); four keys share one max and one rescale, and each key's exp and its
+// value term are independent.  Only a window's queries (nq >= 2): a token keeps the bit-exact per-key kernel.
+bool g_attn_2lvl = false;   // (IK2_ATTN_2LVL=1: measured slower at 32768 - see docs/AMD_IK2_MI50.md)
+int g_attn_2lvl_nk = 2048;
+bool g_attn_2lvl_set = false;
+void attn_2lvl_mode(bool on, int nk) { g_attn_2lvl = on, g_attn_2lvl_nk = nk, g_attn_2lvl_set = true; }
+inline void attn_2lvl_env() {   // (the env pins it once, unless a caller - the test - did)
+    if (g_attn_2lvl_set) return;
+    g_attn_2lvl_set = true;
+    if (std::getenv("IK2_ATTN_2LVL")) g_attn_2lvl = std::atoi(std::getenv("IK2_ATTN_2LVL")) != 0;
+    if (std::getenv("IK2_ATTN_2LVL_NK")) g_attn_2lvl_nk = std::atoi(std::getenv("IK2_ATTN_2LVL_NK"));
+}
 
 namespace {
 
@@ -3859,6 +3872,183 @@ __global__ void attn_split_gqa_kernel(const float* q, const float* r, const KV* 
 }
 #pragma clang fp contract(off)
 
+// The same block, a warp's keys four at a time (KF): the K rows load together, their dots and the
+// two xor butterflies are independent, one max over the four and the running max rescales (m, s, o) once, and the
+// four exps and their value terms accumulate pairwise.  Per key that is one rescale instead of one, 1.25 exps instead
+// of 2, and four independent chains instead of one; a key's own arithmetic (dot, butterfly, expf, the FMA into o) is
+// attn_split_gqa_kernel's, so a partial differs from its only by the order of the group.  The four keys are this
+// warp's own (j, j+4, j+8, j+12 of the stride-4 set it had), so the split, the four-warp merge and the H*P*130
+// partial layout are untouched; keys left over go through the single-key body.
+#pragma clang fp contract(on)
+template <class KV, int G, int KF, bool MASKED, bool RING>
+__global__ void attn_split_gqa4_kernel(const float* q, const float* r, const KV* kc, const KV* vc, int kv_cap, int H,
+                                       int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj,
+                                       int d_rel, int extent, int window, float* part) {
+    __shared__ uint16_t sm_tbl[256];
+    __shared__ float sm_m[G][4], sm_s[G][4];
+    __shared__ __align__(16) float sm_o[G][4][128];
+    const int g = blockIdx.x, p = blockIdx.y, P = gridDim.y, qi = blockIdx.z, tid = threadIdx.x;
+    const int KD = Hkv * 128, qpos = qpos0 + qi, hb = g * G;
+    const int len = (nk + P - 1) / P, j0 = p * len, j1 = min(nk, j0 + len);
+    const int lane = tid & 31, warp = tid >> 5, o = lane * 4;
+    if (sizeof(KV) == 1) fp8_lut_fill(sm_tbl, tid, (int) blockDim.x);
+    __syncthreads();
+    float4 q4[G];
+    float rl[G];
+    const float* qh0 = q + ((size_t) qi * H + hb) * 128;
+    const bool qv4 = ((uintptr_t) qh0 & 15) == 0;
+#pragma unroll
+    for (int i = 0; i < G; ++i) {
+        const float* qh = qh0 + (size_t) i * 128;
+        q4[i] = qv4 ? __ldg((const float4*) (qh + o)) : make_float4(qh[o], qh[o + 1], qh[o + 2], qh[o + 3]);
+        const float* rh = r + ((size_t) qi * H + hb + i) * d_rel;
+        rl[i] = (lane < d_rel) ? __ldg(rh + lane) : 0.0f;
+    }
+    float mw[G], sw[G];
+    float4 ow[G];
+#pragma unroll
+    for (int i = 0; i < G; ++i) mw[i] = -INFINITY, sw[i] = 0.0f, ow[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const int KDg = g * 128;
+    int j = j0 + warp, slot = 0;
+    if (RING) slot = (k0 + j) % kv_cap;
+    const int step = 4 * KF;
+    for (; j + 4 * (KF - 1) < j1; j += step) {
+        size_t off[KF];
+        int dist[KF], slots[KF];
+        bool vis[KF];
+#pragma unroll
+        for (int t = 0; t < KF; ++t) {
+            const int jt = j + 4 * t, pos = k0 + jt;
+            dist[t] = qpos - pos;
+            vis[t] = MASKED ? (dist[t] >= 0 && dist[t] < window) : true;
+            int sl = slot + 4 * t;
+            if (RING) {
+                while (sl >= kv_cap) sl -= kv_cap;
+            }
+            slots[t] = sl;
+            off[t] = (size_t) (RING ? sl : pos) * KD + KDg;
+        }
+        float4 k4[KF], v4[KF];
+#pragma unroll
+        for (int t = 0; t < KF; ++t) k4[t] = kv_row4(kc + off[t], lane, sm_tbl);   // (a masked key's row is still in
+        float l[G][KF];                                                           //  the cache: no bounds risk)
+#pragma unroll
+        for (int t = 0; t < KF; ++t)
+#pragma unroll
+            for (int i = 0; i < G; ++i) {
+                const float a = q4[i].x * k4[t].x + q4[i].y * k4[t].y + q4[i].z * k4[t].z + q4[i].w * k4[t].w;
+                l[i][t] = wsum(a) * qk_scale;
+            }
+#pragma unroll
+        for (int t = 0; t < KF; ++t)
+            if (vis[t] && dist[t] < extent) {   // (a key the query cannot see has no bias row: dist may be < 0)
+                const float pv = (lane < d_rel) ? __ldg(proj + (size_t) dist[t] * d_rel + lane) : 0.0f;
+#pragma unroll
+                for (int i = 0; i < G; ++i) l[i][t] += wsum(rl[i] * pv);
+            }
+#pragma unroll
+        for (int t = 0; t < KF; ++t) v4[t] = kv_row4(vc + off[t], lane, sm_tbl);
+#pragma unroll
+        for (int t = 0; t < KF; ++t)
+            if (!vis[t])
+#pragma unroll
+                for (int i = 0; i < G; ++i) l[i][t] = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < G; ++i) {   // one max, one rescale, KF exps, pairwise sums
+            float m4 = -INFINITY;
+#pragma unroll
+            for (int t = 0; t < KF; ++t) m4 = fmaxf(m4, l[i][t]);
+            const float mn = fmaxf(mw[i], m4);
+            if (mn == -INFINITY) continue;   // (no key of the group is visible: nothing to rescale)
+            const float al = (mw[i] == -INFINITY) ? 0.0f : expf(mw[i] - mn);
+            float be[KF];
+#pragma unroll
+            for (int t = 0; t < KF; ++t) be[t] = (l[i][t] > -INFINITY) ? expf(l[i][t] - mn) : 0.0f;
+            mw[i] = mn;
+            float s2 = 0.0f, o2x = 0.0f, o2y = 0.0f, o2z = 0.0f, o2w = 0.0f;
+#pragma unroll
+            for (int t = 0; t < KF; t += 2) {
+                const float b0 = be[t], b1 = be[t + 1];
+                s2 += b0 + b1;
+                o2x += b0 * v4[t].x + b1 * v4[t + 1].x;
+                o2y += b0 * v4[t].y + b1 * v4[t + 1].y;
+                o2z += b0 * v4[t].z + b1 * v4[t + 1].z;
+                o2w += b0 * v4[t].w + b1 * v4[t + 1].w;
+            }
+            sw[i] = sw[i] * al + s2;
+            ow[i].x = ow[i].x * al + o2x;
+            ow[i].y = ow[i].y * al + o2y;
+            ow[i].z = ow[i].z * al + o2z;
+            ow[i].w = ow[i].w * al + o2w;
+        }
+        if (RING) {
+            slot += step;
+            while (slot >= kv_cap) slot -= kv_cap;
+        }
+    }
+    for (; j < j1; j += 4) {   // the tail: this warp's remaining keys, one at a time (attn_split_gqa_kernel's body)
+        const int pos = k0 + j, dist = qpos - pos;
+        bool vis = true;
+        if (MASKED) vis = dist >= 0 && dist < window;
+        if (vis) {
+            const size_t head_off = (size_t) (RING ? slot : pos) * KD + KDg;
+            const float4 k4 = kv_row4(kc + head_off, lane, sm_tbl);
+            const float4 v4 = kv_row4(vc + head_off, lane, sm_tbl);
+            float l[G];
+#pragma unroll
+            for (int i = 0; i < G; ++i) {
+                const float a = q4[i].x * k4.x + q4[i].y * k4.y + q4[i].z * k4.z + q4[i].w * k4.w;
+                l[i] = wsum(a) * qk_scale;
+            }
+            if (dist < extent) {
+                const float pv = (lane < d_rel) ? __ldg(proj + (size_t) dist * d_rel + lane) : 0.0f;
+#pragma unroll
+                for (int i = 0; i < G; ++i) l[i] += wsum(rl[i] * pv);
+            }
+#pragma unroll
+            for (int i = 0; i < G; ++i) {
+                if (l[i] > -INFINITY) {
+                    const float mn = fmaxf(mw[i], l[i]);
+                    const float al = (mw[i] == -INFINITY) ? 0.0f : expf(mw[i] - mn);
+                    const float be = expf(l[i] - mn);
+                    mw[i] = mn;
+                    sw[i] = sw[i] * al + be;
+                    ow[i].x = ow[i].x * al + v4.x * be;
+                    ow[i].y = ow[i].y * al + v4.y * be;
+                    ow[i].z = ow[i].z * al + v4.z * be;
+                    ow[i].w = ow[i].w * al + v4.w * be;
+                }
+            }
+        }
+        if (RING) {
+            slot += 4;
+            if (slot >= kv_cap) slot -= kv_cap;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < G; ++i) {
+        if (lane == 0) sm_m[i][warp] = mw[i], sm_s[i][warp] = sw[i];
+        *(float4*) (&sm_o[i][warp][o]) = ow[i];
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < G; ++i) {
+        const float M = fmaxf(fmaxf(sm_m[i][0], sm_m[i][1]), fmaxf(sm_m[i][2], sm_m[i][3]));
+        float sum = 0.0f, oo = 0.0f;
+        if (M > -INFINITY) {
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                if (sm_m[i][w] == -INFINITY) continue;
+                const float f = expf(sm_m[i][w] - M);
+                sum += sm_s[i][w] * f;
+                oo += sm_o[i][w][tid] * f;
+            }
+        }
+        float* pp = part + (((size_t) qi * H + hb + i) * P + p) * 130;
+        if (tid == 0) pp[0] = M, pp[1] = sum;
+        pp[2 + tid] = oo;
+    }
+}
 #pragma clang fp contract(off)
 
 template <class KV, int G>
@@ -3866,6 +4056,46 @@ void attn_split_gqa_go(const float* q, const float* r, const KV* kc, const KV* v
                        int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj, int d_rel, int extent,
                        int window, float* part, int P, bool masked, cudaStream_t s) {
     const dim3 gr((unsigned) Hkv, (unsigned) P, (unsigned) nq);
+    // A window's deep context: four keys in flight, one rescale a group (IK2_ATTN_2LVL, IK2_ATTN_2LVL_NK, IK2_ATTN_KF).
+    // A token (nq == 1) and shallow windows keep the per-key kernel, whose partials are bit-identical to the scalar path.
+    attn_2lvl_env();
+    if (g_attn_2lvl && nq >= 2 && nk >= g_attn_2lvl_nk) {
+        static const int kf = std::getenv("IK2_ATTN_KF") ? std::atoi(std::getenv("IK2_ATTN_KF")) : 4;
+        if (kf != 2) {
+            if (kv_cap > 0) {
+                if (masked)
+                    attn_split_gqa4_kernel<KV, G, 4, true, true><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0,
+                        nk, qpos0, qk_scale, proj, d_rel, extent, window, part);
+                else
+                    attn_split_gqa4_kernel<KV, G, 4, false, true><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0,
+                        nk, qpos0, qk_scale, proj, d_rel, extent, window, part);
+            } else {
+                if (masked)
+                    attn_split_gqa4_kernel<KV, G, 4, true, false><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0,
+                        nk, qpos0, qk_scale, proj, d_rel, extent, window, part);
+                else
+                    attn_split_gqa4_kernel<KV, G, 4, false, false><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0,
+                        nk, qpos0, qk_scale, proj, d_rel, extent, window, part);
+            }
+            return;
+        }
+        if (kv_cap > 0) {
+            if (masked)
+                attn_split_gqa4_kernel<KV, G, 2, true, true><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk,
+                    qpos0, qk_scale, proj, d_rel, extent, window, part);
+            else
+                attn_split_gqa4_kernel<KV, G, 2, false, true><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk,
+                    qpos0, qk_scale, proj, d_rel, extent, window, part);
+        } else {
+            if (masked)
+                attn_split_gqa4_kernel<KV, G, 2, true, false><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk,
+                    qpos0, qk_scale, proj, d_rel, extent, window, part);
+            else
+                attn_split_gqa4_kernel<KV, G, 2, false, false><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0,
+                    nk, qpos0, qk_scale, proj, d_rel, extent, window, part);
+        }
+        return;
+    }
     if (kv_cap > 0) {
         if (masked)
             attn_split_gqa_kernel<KV, G, true, true><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0,
