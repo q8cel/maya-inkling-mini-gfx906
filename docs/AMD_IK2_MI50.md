@@ -428,6 +428,36 @@ FP16 and the padding was **reverted** rather than kept as unmeasured plumbing. P
 ids (346 - 357 tok/s across all six runs), so the "q8 costs prefill" note in the older table is a chunk/context effect,
 not a property of the format.
 
+### Planar NVFP4 slots: the reader audit (design only, nothing built)
+
+The other half of the mx transfer is a planar repack of a resident expert's NVFP4 bytes: quants in one plane
+(`[rows][K / 64][32]`), the block scales in another (`[rows][K / 64][4]`, four E4M3 bytes a 64-value block), both rows
+16-byte aligned - the slot's size unchanged (36 B of quants plus 4 B of scales per 64 values, exactly today's 36 B
+block). The win is the load: today `nv_limb_mv` takes an 8-byte `uint2` of quants plus a scale byte per 16-value
+sub-block; planar, two sub-blocks' 16 bytes are contiguous and one `uint4` feeds both, and no load carries a scale.
+The audit, before any code:
+
+| reader | reads a slot's bytes as | would need |
+|---|---|---|
+| `nv_limb_mv` (a token's picks, both phases) | `blob + r * (K/64*36)`, `uint2` + a scale byte | the whole kernel (`K/16` sub-block indexing, both Q8 and NVFP4 branches) |
+| `nv_limb_mv_g` (a window's grouped rows) | the same | the same, plus its two loops |
+| `row_dot` / `row_dot_2` | a row's 36-B blocks, `block_bytes(type)` | the type dispatch's NVFP4 arm |
+| `row_dot_multi` / `row_dot_pair_multi` | the same, several inputs | the same, twice |
+| `experts_gate_up_kernel`, `experts_gate_up_swiglu_kernel`, `experts_down_kernel` | `row_dot_pair_multi`'s helpers | (through the helpers, but each passes `eb[]` offsets) |
+| `experts_gate_up(_swiglu)_g_kernel`, `experts_down_g_kernel` | the grouped limbs (`36 * (k/4)` indexing) | both grouped limbs |
+| `nv_step_load` + `grouped_expert_mma` | 36-B blocks a lane (CUDA only) | (unused on HIP; would have to match if the host layout changed for both) |
+| the CPU lane's `post_expert` | `Ly.host[r] + e * stride[r]` | the host pools |
+| the fill path: `read_into_strided` (load) and `ExpertCache::copy_in` (3 memcpys a slot) | `Ly.eb[r]` bytes | the host layout only, if the repack happens once at load |
+
+That is **seven distinct decode sites** (three scalar helpers, three grouped/scalar kernel families, the limb pair),
+plus the CPU lane and the fill path: more than the four the brief allows, and the *prefill* path (the `experts_*_g`
+kernels and `row_dot_multi`) is exactly the part that would have to be rewritten - the prefill is the path that
+already regressed once when its kernels were touched. So this stops at the design, as instructed, and the prototype it
+calls for is the next step and its own turn: one planar `nv_limb_mv` (NVFP4 only) behind a switch, fed by a device-side
+repack of one slot into a scratch buffer (no second copy in the real path - the load-time host repack would make the
+planar layout *the* layout), and a kernel-only GB/s figure against the 294 GB/s the linear limb kernel measures today
+(the 0.1217 ms an 8-expert layer-visit at 48 visits). The migration list above is the scope of that change.
+
 ## Disabled on gfx906
 
 * **Tensor-core attention and experts** (`mma.sync m16n8k16`, Hopper `wgmma`, `cp.async`, `ldmatrix`,
