@@ -334,6 +334,15 @@ inline void p2(int vis, int slot) {
 }
 const char* const g_p2name[8] = {"gates/msg", "res+rms", "proj(qkv+sink)", "kv convs",
                                  "prep_qkv", "attn kernel", "gate+o+conv", "moe_in"};
+// IK2_WINPROF=1: a verify window (a T > 1 forward) with the stream synchronised at each section's end, its wall time
+// per section - setup (the loop's messages, banks, taps), attention, the MoE's input norm, the routing round trip, the
+// experts (copies, kernels, combine), the rest (the two convs), and the head.  It also counts the window's slots, the
+// distinct experts they took, and the experts copied in from host memory (the ones this GPU's cache did not hold).
+bool g_winprof = false;
+double g_wp[7];
+long g_wp_wins = 0, g_wp_visits = 0, g_wp_slots = 0, g_wp_union = 0, g_wp_miss = 0;
+double g_wp_exp_bytes = 0, g_wp_miss_bytes = 0;
+const char* const g_wpname[7] = {"setup", "attention", "moe_in", "route+sync", "experts", "rest", "head"};
 // The EP block's limb (dp4a) kernels for a pick's gate | up | down: 4.2x the row kernels at the same shapes on gfx906
 // (24.0 vs 35.2 ms a token measured).  CUDA keeps the row kernels it has run (its limb path is the resident one).
 #if defined(STRATA_USE_HIP)
@@ -3153,6 +3162,16 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
     };
 
     int nb_pre = 0, n_bank = 0;   // (a looped core: the blocks before it, the states of the pass before's bank)
+    const bool wp = g_winprof && T > 1 && g_rec;   // (IK2_WINPROF: a verify window, a sync a section)
+    double wpt = now();
+    if (wp) ++g_wp_wins;
+    auto wlap = [&](double& slot) {
+        if (!wp) return;
+        if (!g_wp_host) CU(cudaStreamSynchronize(g_s));
+        const double tn = now();
+        slot += tn - wpt;
+        wpt = tn;
+    };
     for (int vis = 0; vis < c.n_visit; ++vis) {
         const int l = M.V[vis].l;   // (the layer: its weights, its experts in the cache; the state is the visit's)
         Layer& Ly = bind_visit(M, vis);
