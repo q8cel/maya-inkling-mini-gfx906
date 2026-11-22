@@ -53,17 +53,18 @@ experts + 3.4 GiB dense + 2.2 GiB KV + work ≈ 14.4 of 15.8 GiB free, GPU 1 7.4
 ## Measured (2 × MI50, 16 GiB each)
 
 Final state of the branch (`IK2_EP=1`, FP8 KV, `IK2_DRAFT_ADAPT=0`, a shared box with load ~2 - 7). The dense mode
-a row was taken with matters and is named: **the plain rows are the fit check's planar Q8** (what it selects on a free
-card when `IK2_DENSE` is unset and no drafter is loaded; the same runs on FP16 dense are 43.3 - 44.2 tok/s at 255, and
-`IK2_DENSE=f16` forces that), **the spec rows are FP16 dense** (a loaded drafter sets it; `IK2_DENSE=q8` overrides
-either way and costs the window ~20 ms a step):
+a row was taken with matters and is named. On **two** devices the fit check leaves the dense weights **FP16**: its
+planar-Q8 auto-selection sits in the single-GPU branch, so `IK2_DENSE` unset means FP16 here, and `IK2_DENSE=q8` is
+what the 44.9 row (and the 32K row) used - it overrides the mode either way and costs the *window* ~20 ms a step
+(39.2 against 48.1 tok/s), so a loader with `--draft` should leave it unset (`IK2_DENSE=f16` forces FP16 explicitly).
+The spec rows are FP16:
 
 | | llama.cpp (baseline) | maya-ik2, HIP |
 |---|---|---|
-| decode, 255-token context (CLI, 64 tokens) | 30.4 tok/s | **44.9 tok/s** (45.03 / 44.76; 43.3 - 44.2 on FP16 dense) |
-| decode, 32K-token context (CLI) | | **35.1 tok/s** (35.05 / 35.08) |
+| decode, 255-token context (CLI, 64 tokens) | 30.4 tok/s | **43.1 tok/s** (42.73 - 43.51, 5 runs, FP16 default; 44.9 with `IK2_DENSE=q8`) |
+| decode, 32K-token context (CLI) | | **35.1 tok/s** (35.05 / 35.08, `IK2_DENSE=q8`) |
 | prefill, 512 / 32768 tokens (CLI) | 359–389 tok/s | **429 / 440 tok/s** |
-| `--draft`, 512-id README, width 5, `IK2_DRAFT_ADAPT=0` | | **48.1 tok/s**, 2.95 tokens a window, 15.6 + 45.7 ms (1.10x the 43 - 44 plain) |
+| `--draft`, 512-id README, width 5, `IK2_DRAFT_ADAPT=0` | | **48.1 - 49.6 tok/s** (48.9 mean of 5), 2.95 - 3.00 tokens a window, 15.6 + 44.9 - 46.0 ms (1.13x the 43.1 plain) |
 | `ik2_kernels_test` | | **357 checks, 0 failures** |
 
 The 32K decode figure is the final build's (`attn_split_gqa_kernel`, below) and is paired: 35.05 and 35.08 tok/s
@@ -561,7 +562,8 @@ warm; the per-GPU fill is 0.6 s; `READY` follows. Keep the GGUF page-cached for 
    call with an idle queue (11.7 µs pipelined), and the same ~10 µs gap sits around every small kernel. Capturing a
    *window* would take most of it, but the capture crosses two devices; per-layer, two-device graphs are the untested
    alternative.
-3. **The window's pack-ring risk** (latent, not observed): the window path keeps one pinned 5 632-byte group table a
+3. **The window's determinism** (observed once in twelve runs on the final tip - see the audit above): the window
+   path keeps one pinned 5 632-byte group table a
    device and rewrites it every layer, while the copy that reads it is asynchronous. The ordering argument that makes
    it safe is the per-layer routing round trip: layer *l*'s full-stream sync on GPU 0 comes after GPU 0's wait on
    `done[l-1]` (recorded on GPU 1 after its pack copy), so the host cannot rewrite a pack before its previous reader
@@ -570,9 +572,19 @@ warm; the per-GPU fill is 0.6 s; `READY` follows. Keep the GGUF page-cached for 
    slot whose lazy copy may be in flight is classified with the misses and waited for. Any change that removes that
    per-layer sync (the device-side routing this document asks for elsewhere) must give the packs a ring and wait on
    the copy's own event. The one observed divergence was on a *folded-arithmetic* prototype binary during a
-   mid-script relink (3 of 4 identical); the committed arithmetic has been identical in every repeat that completed
-   (5 of 5 in two sessions, and 1 of 1 on the final build - the rest of this turn's repeats were cut short by a
-   contended box).
+   mid-script relink (3 of 4 identical). Measured on the final tip (2026-11-22, 18:00 - 19:00, load ~2 - 3, both
+   cards at 29 - 33 C): **plain decode 5 of 5 identical** (md5 `5608e98aa117`, 512-id README prompt, 64 tokens,
+   42.73 - 43.51 tok/s, FP16 dense); **the window 11 of 12 identical to plain** - the one that was not (`win1`, the
+   first of the twelve) diverged at generation token 52 (model position 563), picking 47528 where the other eleven
+   pick 76, and its accept counts differ at that window (4 accepted drafts against 5), **with the top-2 margin at
+   that position above the 0.05 the near-tie print uses** - i.e. it is not a tie flip but a different logits vector,
+   a structural nondeterminism at roughly 1 in 12 windows. `IK2_EP_WIN=0` (the window over one device's caches) was
+   3 of 3 identical, which narrows it to the EP-window block - the two-device peer copies and the slots owned by the
+   other device - but that path is 21.0 - 21.4 tok/s against plain 43.1, so it is no workaround. The single-buffer
+   packs, the lazy-copy classification (`sseq > g_seq_done`, and the ring's aliasing sync) and the per-visit event
+   chain were re-read under this evidence and are each conservative; the next experiment is to force every row into
+   the miss part (`late = true`), which waits on the copy event for hits too - if the flips stop, a hit reads a slot
+   whose bytes are not final and the fix is that wait, unconditionally. That is open work item 3.
 4. **The limb kernels' epilogues and floor**: the fused gate / up SwiGLU epilogue is 21 % of a visit (0.025 ms) and
    MUFU-latency bound, and the limb kernels read at 294 GB/s against the memory's 890 (an 8-expert visit 0.1217 ms).
    The planar slot repack measured 0.84x (its own section), so what is left here is the epilogue and the read floor,
