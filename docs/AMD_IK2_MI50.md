@@ -403,6 +403,31 @@ On the acceptance for this attempt: 32K attention <= 6 ms a token is **not** met
 58, and the plain stream is 31.85 tok/s on a shared box (34.4 - 34.6 idle). The prefetch and the mapping are recorded
 here as measured negatives; the committed kernel is what runs.
 
+### The planar Q8 row stride: padded, measured, within noise (reverted)
+
+A Q8_0 row of 2304 B is 18 x 128 B, so every row of a planar matrix starts on the same memory channels;
+`mx-llama.cpp`'s repack de-aliases by padding a row to `K + 16` bytes (9 - 15 % decode there). Done here for every
+planar reader - `upload_planar` (row by row into `N x q8_ld(K)` and `N x q8d_ld(K)`), `mv_q8p_kernel`,
+`decode_q8p_f16` (which became a rows x K kernel, three call sites), `mat_rows`, the block path's `tile_rows`, and the
+`mv_q8p` test's own planes - with `q8_ld(K) = K + 16` and `q8d_ld(K) = K / 32 + 8` halves (16 B) in the header, and
+`kQ8RowPad = 0` on CUDA so its tensor-core tile kernel is untouched. `test_attn_gqa`'s sibling checks stayed green and
+`mv_q8p` agreed with its reference at 0.01 of tolerance, so the stride plumbing was right. The 512-id README prompt,
+plain, EP, FP8 KV, `gen 63`:
+
+| dense weights | prefill | decode | decode, mean |
+|---|---|---|---|
+| FP16 (two runs) | 354.4 / 346.0 tok/s | 42.85 / 43.75 tok/s | 43.30 |
+| planar Q8, row pad 16 B (two runs) | 355.9 / 356.9 | 43.67 / 43.79 | **43.73** |
+| planar Q8, no pad (two runs) | 357.5 / 357.1 | 43.74 / 43.31 | 43.53 |
+
+Two things follow. The de-alias is **+0.5 %** here (43.73 against 43.53), inside this box's +-1.2 % run-to-run spread,
+so gfx906's channel interleave is not what limits maya's q8 GEMV - `mv_q8p_kernel` reads a row in 128-B chunks a warp,
+four rows a block, and the 16-B shift does not move what it waits on. And planar Q8 is **+1.0 %** over FP16 dense
+(43.7 against 43.3), not the 9 - 15 % mx sees on its shapes: the acceptance was `>= 5 %`, so the dense default stays
+FP16 and the padding was **reverted** rather than kept as unmeasured plumbing. Prefill is neutral either way at 512
+ids (346 - 357 tok/s across all six runs), so the "q8 costs prefill" note in the older table is a chunk/context effect,
+not a property of the format.
+
 ## Disabled on gfx906
 
 * **Tensor-core attention and experts** (`mma.sync m16n8k16`, Hopper `wgmma`, `cp.async`, `ldmatrix`,
