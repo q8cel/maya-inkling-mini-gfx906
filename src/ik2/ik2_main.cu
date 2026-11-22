@@ -4879,7 +4879,10 @@ int main(int argc, char** argv) {
         }
         const bool fits = exp_b + dense_b + kv_b + draft_b + (size_t) ctx * draft_tok + reserve <= fr0 &&
                           exp_b <= (size_t) (cache_gb * 1073741824.0);
-        if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
+        // (a drafter keeps the dense weights FP16: the window's projections at T > 1 want the FP16 GEMV, and a
+        //  planar Q8 head routes the drafter's base logits through the tensor-core tile kernel this build lacks -
+        //  with it the --draft path measured 39.1 tok/s at the 512-id prompt against 48.7 on FP16 dense)
+        if (fits && !getenv("IK2_DENSE") && draft_path.empty()) g_dense_q8 = true;
         g_fast_want = fits && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
         stage_cold = getenv("IK2_STAGE_COLD") && atoi(getenv("IK2_STAGE_COLD"));
         g_managed_experts = g_fast_want && g_kv_managed && getenv("IK2_TIER") && atoi(getenv("IK2_TIER"));
@@ -5418,12 +5421,19 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             die(e.what());
         }
+#if defined(STRATA_USE_HIP)
+        // (a planar Q8 head's base logits go through k::q8_tile, a tensor-core kernel this build does not have: the
+        //  drafter keeps the FP16 copy the fold made - 0.9 GiB on GPU 0 - rather than abort at the first proposal.
+        //  Without this, --draft died as soon as the dense weights were planar Q8, which the EP fit check turns on.)
+        (void) drafter;
+#else
         if (M.out_w.q8 && draft_head != M.out_w.f16) {   // (the FP16 copy was the fold's: the base logits from the blocks)
             ik2::draft::set_head_q8(drafter, M.out_w.q8, M.out_w.q8d);
             CU(cudaStreamSynchronize(g_s));
             CU(cudaFree(draft_head));
             draft_head = nullptr;
         }
+#endif
         g_taps_ld = std::max(chunk, ik2::draft::kBlock);
         g_taps = dalloc<float>((size_t) (g_final_tap + 1) * g_taps_ld * c.C);
         for (auto& Vi : M.V) {

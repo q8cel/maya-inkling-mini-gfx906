@@ -52,15 +52,16 @@ experts + 3.4 GiB dense + 2.2 GiB KV + work ≈ 14.4 of 15.8 GiB free, GPU 1 7.4
 
 ## Measured (2 × MI50, 16 GiB each)
 
+Final state of the branch (`IK2_EP=1`, FP8 KV, `IK2_DRAFT_ADAPT=0`, a shared box with load ~2 - 7: the plain rows
+were taken with the planar Q8 dense the fit check enables, the spec rows with the FP16 dense a drafter selects):
+
 | | llama.cpp (baseline) | maya-ik2, HIP |
 |---|---|---|
-| decode, 255-token context (CLI, 64 tokens) | 30.4 tok/s | **44.2 tok/s** (22.6 ms/token) |
-| decode, 255-token context (server, 51-token prompt) | | **45.5 tok/s** |
-| decode, 5.1K-token context (server) | | 39.5 tok/s |
-| decode, 32K-token context (CLI) | | **32.2 tok/s** (31.1 ms/token) |
-| prefill, 512 / 32768 tokens (CLI) | 359–389 tok/s | **414 / 442 tok/s** |
-| prefill, 5152 tokens (server) | | **644.9 tok/s** |
-| `ik2_kernels_test` | | **344 checks, 0 failures** (4 mma.sync tests skipped by name) |
+| decode, 255-token context (CLI, 64 tokens) | 30.4 tok/s | **44.9 tok/s** (45.03 / 44.76; 43.3 - 44.2 on FP16 dense) |
+| decode, 32K-token context (CLI) | | **35.1 tok/s** (35.05 / 35.08) |
+| prefill, 512 / 32768 tokens (CLI) | 359–389 tok/s | **429 / 440 tok/s** |
+| `--draft`, 512-id README, width 5, `IK2_DRAFT_ADAPT=0` | | **48.1 tok/s**, 2.95 tokens a window, 15.6 + 45.7 ms (1.10x the 43 - 44 plain) |
+| `ik2_kernels_test` | | **357 checks, 0 failures** |
 
 The 32K decode figure is the final build's (`attn_split_gqa_kernel`, below). The same binary measured 33.4 tok/s
 (30.0 ms/token) on a cool machine: a sustained hour of load costs ~20 % of this kernel's throughput (the
@@ -491,6 +492,30 @@ maths is comparable; it just cannot be made faster this way.
 needed to be worth its seven decode sites. The limb kernels keep their 36-byte blocks; the remaining limb headroom is
 the SwiGLU epilogue and the memory floor the doc already records, not the slot's layout.
 
+### The window's ordering, audited, and two fixes it turned up
+
+A code-level pass over the two-device window path (per-visit events `x / cp[d] / done`, the single-buffer pack a
+device, the hit / miss classification, the peer writes) finds **no live race**, and the reason is worth stating because
+it is load-bearing: every layer's routing ends in a full-stream synchronisation of GPU 0, and GPU 0 has by then waited
+on `done[l-1]`, which GPU 1 records after its pack copy and its y-rows copy. So at the top of layer *l* both devices
+have finished layer *l-1* - the packs can be rewritten, `Ed.get` can evict, and the previous layer's kernels cannot
+still be reading what it frees. The events are indexed by visit and re-recorded only in the next window, whose
+predecessor ended synchronised; a slot whose lazy copy might be in flight (a prompt's or an earlier layer's) is
+classified with the misses and waited for on the copy stream before its kernels run. The residual risks are recorded
+in open work: the single-buffer packs and the eviction ordering both *depend* on that per-layer sync.
+
+The audit did turn up two real faults in the configuration the fit check now enables, both fixed here:
+
+* **`--draft` aborted** as soon as the dense weights were planar Q8: the drafter's base logits go through
+  `k::q8_tile`, a tensor-core kernel this build does not have, and the fit check had started selecting planar Q8 on a
+  free box. The HIP build now leaves the drafter on the FP16 head copy the fold already makes (0.9 GiB on GPU 0)
+  instead of calling into the missing kernel.
+* **A drafter now keeps the dense weights FP16** (`draft_path.empty()` in the fit check): with planar Q8 the window's
+  projections at T > 1 lose ~30 % (39.2 against 48.1 tok/s on the 512-id README prompt, verify 67.6 against 45.7 ms).
+  Plain decode keeps planar Q8's +1 % when no drafter is loaded.
+
+With those two, the spec path runs in its intended configuration and the tests stay at 357 checks, 0 failures.
+
 ## Disabled on gfx906
 
 * **Tensor-core attention and experts** (`mma.sync m16n8k16`, Hopper `wgmma`, `cp.async`, `ldmatrix`,
@@ -516,48 +541,35 @@ warm; the per-GPU fill is 0.6 s; `READY` follows. Keep the GGUF page-cached for 
 
 ## Open work
 
-1. The token loop's per-kernel pipeline gap: the attention phase measures ~13.8 ms a token against ~6 ms of
-   kernel service in isolation, and is not the context footprint (8192 vs 131072 changes nothing). The
-   device-side pick split removed the per-layer host round trip and its packs (**+0.6–0.8 ms a token**:
-   43.4 → 44.2 tok/s at 255 tokens, 31.0 → 31.7 at 32K — the table above has the current figures). What remains
-   is the gap between kernels: graph capture would attack it, but capturing across two devices is the blocker;
-   per-layer, two-device graphs are the untested alternative.
-2. `attn_res_rms_f16` costs ~25 µs a call with an idle queue (one block of 512 threads, latency-bound; the
-   isolated pipelined figure is 11.7 µs). The ~10 µs around each of the two calls a visit — and the same gap
-   on every other small kernel — is the pipeline overhead above, not kernel time.
-3. Deep-context attention: 10.05 -> 6.3-7.5 ms a token at 32K with the GQA split kernel (`attn_split_gqa_kernel`
-   in `src/ik2/ik2_kernels.cu`): a block a K / V head, its `H / Hkv` (3 here) query heads in one pass over the
-   keys, so each K / V row is read and FP8-decoded once instead of three times, 16-byte loads, the E4M3 decode
-   from a 256-entry LDS table, and the sliding layers' ring index incremental instead of a per-key divide.
-   `IK2_ATTN_GQA=0` runs the previous scalar `attn_split_kernel` (bit-identical to the branch tip). `test_attn_gqa`
-   in `tests/ik2_kernels_test.cu` compares the two on the same K / V for H 24 / KV 8 (full, ring), H 48 / KV 8
-   (GQA 6, masked ring) and an FP16 cache, and checks that a shape no GQA kernel takes (H 16 / KV 4) stays on the
-   scalar path bit for bit; `attn_gqa_mode()` is the hook it switches them with. That is the 3x fewer K / V reads;
-   what is left is issue count and latency (IPC 0.57 against the scalar path's 0.94): 6 `expf` a key (13
-   instructions each, kept for bit-exactness), three 32-lane xor butterflies (15 `ds_bpermute` + waits), and the
-   LDS table read feeding the dot. Next shapes: a warp taking 4 keys with 8-lane reduces (9 shuffles per 4 keys),
-   or `exp2f` (2 instructions) if a last-bit change is acceptable.
-4. Planar Q8 dense (`IK2_DENSE=q8`) works with EP and halves the dense bytes a token reads (42.9 → 43.2
-   tok/s before the sync; 43.0 → 43.8 on the 512-id README prompt after it). The old prefill penalty did not
-   reproduce on that prompt after the sync (366.9 against 362.4 tok/s plain), so treat `421 → 209` as
-   chunk/context-dependent and measure before enabling: opt-in only.
-5. The drafter's verify window: deterministic at 255 (5 of 5 repeats, above) after the copy-stream and event fixes,
-   but not complete: on a folded-arithmetic binary the same 255 runs gave four different streams in five where the
-   committed arithmetic gives five identical, and on a busy box one README repeat in three still flipped a near tie.
-   The next suspects are a host-side pack buffer reused before the GPU consumed it (the window's pack ring is four
-   deep, one a device a layer) and a slot evicted by a later layer while an earlier layer's kernel still reads it -
-   the expert path itself is not one. Then: the
-   experts' 297 GB/s over the two devices is one device's rate (147 GB/s a device against `nv_limb_mv`'s 294), the
-   window's dense GEMV reads 195 GB/s against `mv_f16_token`'s 840 (a shared-memory tile of `x` and a warp 4 rows of
-   the matrix both measured slower and were dropped), and the routing's 48 D2H syncs (4 ms) need device-side expert
-   tables, which need every owned expert resident - `g_ep_split` is off here. A CUDA graph a window size is the other
-   2 - 3x, and a sampler-aware accept rule comes before the server can have one.
-6. The limb (`__dp4a`) expert kernels are bandwidth-bound where they read: kernel-only **294 GB/s** (gate+up 332,
-   down 240; **0.1217 ms** an 8-expert layer-visit = **5.84 ms a token** at 48 visits; the floor at the memory's
-   890 GB/s is 0.0403 ms). The non-invasive variants tried - preloading and unrolling, row pairs, a batched
-   SwiGLU, other block sizes - measured 0.1184 ms at best (**-2.9 %**, inside machine drift) and were reverted.
-   The promising route is an in-place planar repack of the resident NVFP4 slots (aligned quants plus one scale
-   dword) with an aligned `NvInput`, estimated **0.075 - 0.085 ms a visit** (+2 - 3 tok/s), but every slot-reading
-   expert kernel - the prefill grouped and scalar ones included - would have to learn the layout; not taken here.
-   The SwiGLU epilogue is 21 % of a visit (0.025 ms) and MUFU-latency bound, so the repack's gain is in the loads,
-   not the epilogue.
+1. **The attention kernel's read shape** (the one axis still open): 7.46 ms a token at 32K for 1.02 GB of K / V, i.e.
+   137 GB/s, and 244 GB/s in a window. A block reads 384 B - its three query heads' slices - out of a 1 KiB K / V
+   row that seven other blocks read separately, so the pattern's own ceiling is ~334 GB/s and the kernel sits at
+   41 % of that (the window, 73 %). The redesign is a whole-row read: one block taking all eight K heads' slices for
+   its keys (24 query heads of accumulators - 3 KiB of LDS a block - or a heads-major cache, which is a format change
+   for the cache, the prefill and the scalar path). Everything cheaper on this kernel is closed and measured: the
+   instruction stream (4.4 %), a two-deep prefetch (-2.3 %), 8-lane x 4-key (over the register budget), cross-query
+   sharing (0.84 - 0.86x), log2/exp2f (2.3x over the FP8 reference check).
+2. **Cross-device graphs**: the token loop's pipeline gap is still the biggest single loss - the attention phase
+   measures ~13.8 ms a token against ~6 ms of kernel service in isolation, `attn_res_rms_f16` alone costs ~25 µs a
+   call with an idle queue (11.7 µs pipelined), and the same ~10 µs gap sits around every small kernel. Capturing a
+   *window* would take most of it, but the capture crosses two devices; per-layer, two-device graphs are the untested
+   alternative.
+3. **The window's pack-ring risk** (latent, not observed): the window path keeps one pinned 5 632-byte group table a
+   device and rewrites it every layer, while the copy that reads it is asynchronous. The ordering argument that makes
+   it safe is the per-layer routing round trip: layer *l*'s full-stream sync on GPU 0 comes after GPU 0's wait on
+   `done[l-1]` (recorded on GPU 1 after its pack copy), so the host cannot rewrite a pack before its previous reader
+   has finished; the same sync is what orders `Ed.get`'s evictions against the previous layer's kernels on both
+   devices. The events are per visit and only re-recorded in the next window (each window ends synchronised), and a
+   slot whose lazy copy may be in flight is classified with the misses and waited for. Any change that removes that
+   per-layer sync (the device-side routing this document asks for elsewhere) must give the packs a ring and wait on
+   the copy's own event. The one observed divergence was on a *folded-arithmetic* prototype binary during a
+   mid-script relink (3 of 4 identical); the committed arithmetic has been identical in every repeat that completed
+   (5 of 5 in two sessions, and 1 of 1 on the final build - the rest of this turn's repeats were cut short by a
+   contended box).
+4. **The limb kernels' epilogues and floor**: the fused gate / up SwiGLU epilogue is 21 % of a visit (0.025 ms) and
+   MUFU-latency bound, and the limb kernels read at 294 GB/s against the memory's 890 (an 8-expert visit 0.1217 ms).
+   The planar slot repack measured 0.84x (its own section), so what is left here is the epilogue and the read floor,
+   not the layout.
+5. `IK2_DENSE=q8` remains opt-in and is now never chosen when a drafter is loaded: it is +1 % on plain decode at 512
+   ids (43.7 against 43.3) and the window's projections at T > 1 lose ~30 % with it (39.2 against 48.1 tok/s), which
+   is what the fit check's `draft_path.empty()` clause enforces.
