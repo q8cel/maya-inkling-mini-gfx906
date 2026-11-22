@@ -69,7 +69,10 @@ context-independent sections drift ~4 % in the same window), so treat 32.2-33.4 
 ### After the upstream sync (`e819852`)
 
 The merge re-applied the HIP guards on upstream's new code; all three targets build for gfx906 and
-`ik2_kernels_test` is **344 checks, 0 failures**. Newly disabled by HIP: upstream's single-token EP expert fast path
+`ik2_kernels_test` is **344 checks, 0 failures**. The 345-check log quoted during the sync was not the committed
+tip: it included an uncommitted `attn window queries / per-query: H24 KV8 8 queries 5000 keys` check (a window
+experiment; `/tmp/kt_new.log`). A clean build of `c11d62e` runs 344 `ok` checks with exactly this tree's list, so
+no check was lost in the merge. Newly disabled by HIP: upstream's single-token EP expert fast path
 now calls `experts_gate_up_swiglu_mma` / `experts_down_mma` (on unless `IK2_EXPERT_MMA=0`) when `experts_mma_fits`
 accepts the expert types; on HIP that predicate returns false, so the EP token path keeps the limb (`__dp4a`)
 kernels. Both MMA entry points are stubs that abort with a clear message, so naming them directly fails loudly
@@ -89,12 +92,26 @@ Measured after the merge (two runs each, same box and commands as the table abov
 | prefill of that prompt | 435.8 tok/s | 441.7 tok/s |
 
 That is inside the pre-sync spread (the table's 42.7 tok/s on 511 README ids; the 32K logs above range 30.2-34.8
-tok/s), so the merge did not regress plain decode. The 512-id smoke produced 64 ids each time, but the two runs
-parted at token 27 on a near tie (`197020` against `196978`) - the run-to-run drift already noted; the 32768-id run
-repeated the same 31 ids both times (`69201 69057 220 ...`).
+tok/s), so the merge did not regress plain decode; the 32768-id run repeated the same 31 ids both times
+(`69201 69057 220 ...`). The 512-id pair above differed under the pre-fix nondeterminism described below.
 
-Deterministic across runs except at near ties (a reduction-order flip can pick the other token; the post-sync
-512-id smoke parted at one): greedy output repeats. **EP is bit-identical to a single GPU in attention, not in the
+Prefill A/B, pre-sync `c11d62e` against the merge, three alternating runs each on the same 512-id prompt and flags:
+pre-sync 361.6 / 363.7 / 362.9 tok/s, merged 358.7 / 354.1 / 364.8 tok/s - no regression. The older 414 tok/s
+512-token row was a different prompt file (`ik2-prompt.txt`, 511 ids), not this one.
+
+**Greedy output was not deterministic before the fix, and the merge did not cause it.** Five identical 2-card runs
+gave two different streams: `bd4882...` twice and `09d243...` three times, parting at token 27. Upstream's new
+priority stream and lazy CPU lane are inactive here (`g_ls` is created only for one GPU; `g_pool` is null under
+EP), and FP16 KV flips the same way. The layer dumps are bit-identical through visit 17 and first differ in visit
+18's attention - the first pass > 0, whose message gates call `cublasSgemm` on 512 rows. rocBLAS' SGEMM splits K
+with atomic accumulation on gfx906: repeated calls on one matrix differ by 1.5e-8, and two processes' outputs
+differ, enough for the FP8 cache's near ties. It reproduces at `c11d62e`, so it predates the merge. The HIP build
+now sets `hipblasSetAtomicsMode(..., HIPBLAS_ATOMICS_NOT_ALLOWED)` on its BLAS handles
+(`include/strata/hip_compat/cublas_v2.h`); five more identical runs then produced one stream (`09d243...`, 5 of 5).
+Decode stays 42.8-44.3 tok/s and 32K 34.39 / 34.43 tok/s, while the 512-id prefill measures 345-354 tok/s (about
+2 % below the pre-fix 354-365) because the loop gates then take rocBLAS' deterministic kernels.
+
+**EP is bit-identical to a single GPU in attention, not in the
 experts.** Measured on a 255-id prompt taken a token at a time (`--chunk 1`, the decode path) with both attention
 dispatch modes, against one GPU: the first visit's attention output is bit-identical (`attn_out`, worst |Δ| = 0.0,
 `IK2_ATTN_GQA` 0 and 1), while that visit's MoE output already differs (`out` 1.5e-4 scalar attention / 1.9e-4 GQA)

@@ -41,6 +41,10 @@
 #define cublasHandle_t hipblasHandle_t
 #define cublasSetMathMode hipblasSetMathMode
 #define cublasSetStream hipblasSetStream
+// (a port's determinism: rocBLAS' SGEMM may accumulate with atomics, so two runs' loop-gate sums differ in the last
+//  bits and a near tie can flip; not allowing atomics drops those kernels)
+#define CUBLAS_ATOMICS_NOT_ALLOWED HIPBLAS_ATOMICS_NOT_ALLOWED
+#define cublasSetAtomicsMode hipblasSetAtomicsMode
 #if defined(hipblasVersionMajor) && hipblasVersionMajor < 3
 // hipBLAS 2.x has no hipblasSetWorkspace: rocBLAS then sizes its own workspace (a no-op, the GEMMs are the same)
 static inline hipblasStatus_t strata_hipblas_set_workspace_noop(hipblasHandle_t, void*, size_t) {

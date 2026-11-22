@@ -4746,6 +4746,12 @@ int main(int argc, char** argv) {
         CB(cublasCreate(&g_dev[d].blas));
         CB(cublasSetStream(g_dev[d].blas, g_dev[d].s));
         CB(cublasSetMathMode(g_dev[d].blas, CUBLAS_DEFAULT_MATH));
+#if defined(STRATA_USE_HIP)
+        // rocBLAS' SGEMM may split K with atomic accumulation: the loop gates' sums then differ between runs in the
+        // last bits, and an FP8 cache's near ties amplify it into a different greedy stream. Not allowing atomics
+        // selects the deterministic kernels (measured: 5 of 5 runs then repeat, where 2 of 5 had flipped).
+        CB(cublasSetAtomicsMode(g_dev[d].blas, CUBLAS_ATOMICS_NOT_ALLOWED));
+#endif
     }
     g_ep = n_gpu == 2 && getenv("IK2_EP") && std::atoi(getenv("IK2_EP"));
     g_tp = n_gpu == 2 && !g_ep && getenv("IK2_TP") && std::atoi(getenv("IK2_TP"));
