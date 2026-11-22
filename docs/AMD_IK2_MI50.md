@@ -325,9 +325,36 @@ for this kernel is therefore *fewer bytes or fewer instructions a key*, not a sh
 sharing designs (86.0 / 92.5 ms) and this one bracket the space, and the block-shaped answer (the CUDA path's
 `attn_block_mma`, and a two-level softmax on top of it) needs tensor cores this build does not have.
 
-The four-key kernel stays in the tree, off by default and covered by `test_attn_two_level` (full, sliding ring with a
-mask, GQA 6, an FP16 cache, a tail key count, the KF = 2 group; 13 checks, 1e-5 relative against the per-key kernel), so
-that the next attempt at this kernel starts from a measured negative rather than a guess.
+The four-key kernel and its test were **removed** after the next round of experiments (below): it was off by default,
+it lost, and keeping it in step with the per-key kernel's arithmetic cost more than it was worth. Its numbers stand in
+the table above.
+
+### Per-key instruction work: measured, and where the bound actually is
+
+The obvious next lever was instructions a key: two `expf` (about 13 each) and two 5-step butterflies per key per head.
+Both were built and measured on this branch (`IK2_DRAFT_ADAPT=0`, paired runs, same condition), then reverted:
+
+| 32768 ids | attention kernel, plain decode | 32K window, verify / attention | verdict |
+|---|---|---|---|
+| baseline (`bccebae`) | 7.46 / 7.47 ms a token | 64.1 / 64.6 ms, 36.0 / 36.2 | - |
+| the online softmax in log2 units, `exp2f` (MUFU) for its two exps, and the bias folded into the dot's butterfly | **7.13** (-4.4 %), plain 31.85 -> 32.20 tok/s | not run | **rejected**: the 16640-key FP8 reference check (`attn_decode_fp8 P=128 raw`, 1 of 6144 values) goes from inside its 5e-6 + 2e-4|v| bound to 2.3x outside it (2.8e-5 against 1.2e-5) - a 4 % gain does not buy that |
+| the two butterflies merged in natural units (`r` pre-divided by `qk_scale`), `expf` kept | **7.40** (-0.8 %) at 32K, **1.63** against 1.65 at 255 | 63.3, 35.4 (-1.2 %) | **rejected**: noise-level, and it rewrites the plain greedy stream at 255 from the first token (69201... against 145989...) - that prompt's first-token margin is under the fold's ~1e-5 logit shift |
+
+The reference checks and `test_attn_gqa` are what decided it: the fold alone is *correct* to 1e-7 (it passed every
+5-check GQA comparison at 0.01 of the 1e-5 tolerance and the 16640-key FP8 check), and `exp2f` is what the FP8
+reference catches. So the numbers above are the kernel's *sensitivity to instructions*: removing ~40 % of the per-key
+instruction stream (both exps) bought 4.4 %; removing one of the two reductions bought ~1 %. At 32K the kernel is
+therefore ~95 % memory latency, not issue: `len = nk / P = 256` keys a block, 64 a warp, and the K / V stream moves at
+65 GB/s of the memory's 890. The lever left is memory-level parallelism and load shape per key - the 8-lane x 4-key
+mapping (16 B a lane per row instead of 4) and prefetching the next key's row - not arithmetic. A DPP-based 32-lane
+reduce (the recon of `mx-llama.cpp`'s `repack-common.cuh`) sits on the same axis as the butterfly that just bought ~1 %,
+so it is not where the time is; and the recon's FP8 loader and wide vector attention both measured slower in that fork.
+
+One more observation from the same runs: on the folded binary the 255 window produced four different streams in five
+runs (the committed binary had given five identical), one of them with a different accepted-draft histogram. The fold
+only shifts logits by ~1e-5, so what it did was *expose* the residual copy race the last commit left open (a slot
+evicted by a later layer while an earlier layer's kernel still reads it) - the item is still open, and the committed
+arithmetic is the one that repeats.
 
 ## Disabled on gfx906
 
