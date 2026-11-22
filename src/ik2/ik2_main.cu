@@ -30,30 +30,17 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <fcntl.h>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#include <io.h>
-#define O_RDONLY (_O_RDONLY | _O_BINARY)
-#define open _open
-#define close _close
-typedef SSIZE_T ssize_t;
-#define off_t int64_t
-static inline ssize_t pread(int fd, void* buf, size_t count, int64_t offset) {
-    if (_lseeki64(fd, offset, SEEK_SET) == -1) return -1;
-    return _read(fd, buf, (unsigned int)count);
-}
-#define posix_fadvise(fd, off, len, adv) ((void)0)
-#define MADV_WILLNEED 0
-static inline int madvise(void*, size_t, int) { return 0; }
-static inline int munmap(void*, size_t) { return 0; }
-#ifndef SIGUSR1
-#define SIGUSR1 30
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #else
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -135,6 +122,20 @@ namespace k = ik2::k;
 [[noreturn]] void die(const std::string& m) {
     std::fprintf(stderr, "maya-ik2: %s\n", m.c_str());
     std::exit(1);
+}
+
+std::string fmt_gib(size_t b) {
+    char m[32];
+    std::snprintf(m, sizeof m, "%.2f GiB", b / 1073741824.0);
+    return m;
+}
+std::string g_fit_hint;   // the start's note when the experts did not fit, for the late check
+bool g_serve_note = false;   // --serve (Maya's protocol): notes also as NOTE lines, which serve/server.py prints
+// a line for the log, and under --serve the same as a NOTE (the server relays NOTE, INFO and VRAM lines only)
+void note(const std::string& m) {
+    std::printf("%s\n", m.c_str());
+    if (g_serve_note) std::printf("NOTE maya-ik2: %s\n", m.c_str());
+    std::fflush(stdout);
 }
 
 double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -311,8 +312,16 @@ bool g_overlap = true;      // IK2_OVERLAP=0: the copies on the compute stream, 
 // The CPU lane (IK2_CPU=1: on): a missing NVFP4 expert computed in host memory by the pool while the others' blocks
 // are copied; its own blocks follow on the copy stream without being waited for ("lazy"), so it is in VRAM next time.
 ik2::cpu::Pool* g_pool = nullptr;
-double g_t_cpu = 0.5e-3, g_t_up = 0.36e-3;   // seconds an expert: the pool's (measured as it runs), the link's
+double g_t_cpu_f[2] = {0.5e-3, 1.0e-3};   // seconds an expert on the pool, NVFP4 and Q8_0 (measured as it runs)
+double& g_t_cpu = g_t_cpu_f[0];
+bool g_cpu_q8 = false;                     // IK2_CPU_Q8=1: Q8_0 experts on the CPU lane too
+double g_t_up = 0.36e-3;   // seconds an expert: the pool's (measured as it runs), the link's
 uint64_t g_n_cpu = 0, g_n_wait = 0;
+double g_cpu_busy = 0;   // the CPU lane's batches: their time in all, how many
+long g_cpu_batches = 0;
+bool g_lazy_cpu = false;   // IK2_LAZY_CPU=1: an expert still arriving from a lazy copy computed on the CPU
+int g_lazy_max = 0, g_lazy_per = 0;   // IK2_LAZY_MAX, IK2_LAZY_PER: lazy batches in flight, lazy copies a call (0: any)
+cudaStream_t g_ls = nullptr;          // IK2_LAZY_STREAM=1: lazy copies on their own stream
 bool g_cpu_lazy = true;   // IK2_CPU_LAZY=0: a CPU-computed expert is not copied in afterwards (the link carries less)
 constexpr int kRing = 256;
 cudaEvent_t g_ring[kRing];                   // a lazy batch's end on the copy stream, by sequence number
@@ -788,6 +797,23 @@ uint16_t* load_f16(const Shards& S, const std::string& n, size_t expect) { retur
 
 // ---- loading the experts into pinned host memory: pread from the files, several at once
 
+#ifdef _WIN32
+inline void* ik2_anon_alloc(size_t bytes) {
+    return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+}
+inline void ik2_anon_free(void* p, size_t) {
+    if (p) VirtualFree(p, 0, MEM_RELEASE);
+}
+#else
+inline void* ik2_anon_alloc(size_t bytes) {
+    void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? nullptr : p;
+}
+inline void ik2_anon_free(void* p, size_t bytes) {
+    if (p) ::munmap(p, bytes);
+}
+#endif
+
 struct Pinned {
     struct Block {
         void* ptr = nullptr;
@@ -800,7 +826,7 @@ struct Pinned {
         for (const auto& b : blocks) {
             if (b.mapped) {
                 if (b.registered) cudaHostUnregister(b.ptr);
-                ::munmap(b.ptr, b.bytes);
+                ik2_anon_free(b.ptr, b.bytes);
             } else if (b.ptr) {
                 cudaFreeHost(b.ptr);
             }
@@ -810,6 +836,31 @@ struct Pinned {
 
 void read_into_strided(const std::string& path, uint64_t off, int n_exp, size_t exp_bytes, size_t dst_stride,
                        uint8_t* dst) {
+#ifdef _WIN32
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) die("cannot open " + path);
+    const size_t chunk = 64ull << 20;
+    for (int e = 0; e < n_exp; ++e) {
+        size_t done = 0;
+        uint8_t* ep = dst + (size_t) e * dst_stride;
+        const uint64_t eoff = off + (uint64_t) e * exp_bytes;
+        while (done < exp_bytes) {
+            const DWORD want = (DWORD) std::min(chunk, exp_bytes - done);
+            OVERLAPPED ov{};
+            const uint64_t pos = eoff + done;
+            ov.Offset = (DWORD) (pos & 0xFFFFFFFFull);
+            ov.OffsetHigh = (DWORD) (pos >> 32);
+            DWORD got = 0;
+            if (!ReadFile(h, ep + done, want, &got, &ov) || got == 0) {
+                CloseHandle(h);
+                die("read failed: " + path);
+            }
+            done += (size_t) got;
+        }
+    }
+    CloseHandle(h);
+#else
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) die("cannot open " + path);
     const size_t chunk = 64ull << 20;
@@ -825,6 +876,7 @@ void read_into_strided(const std::string& path, uint64_t off, int n_exp, size_t 
     }
     posix_fadvise(fd, (off_t) off, (off_t) ((uint64_t) n_exp * exp_bytes), POSIX_FADV_DONTNEED);
     ::close(fd);
+#endif
 }
 
 // ---- the expert cache in VRAM: per-size-class pools, O(1) S3-FIFO with ghost history
@@ -992,6 +1044,7 @@ struct ExpertCache {
             if (s >= 0) return s;
             if (attempt == 0 && saw_busy_lazy) {
                 CU(cudaStreamSynchronize(g_cs));
+                if (g_ls) CU(cudaStreamSynchronize(g_ls));
                 g_seq_done = g_seq_next - 1;
                 continue;
             }
@@ -1878,6 +1931,7 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
     const double te0 = now();
     if (g_seq_done + 1 < g_seq_next) {
         CU(cudaStreamSynchronize(g_cs));
+        if (g_ls) CU(cudaStreamSynchronize(g_ls));
         g_seq_done = g_seq_next - 1;
     }
     std::fill(W.cnt.begin(), W.cnt.end(), 0);
@@ -3312,8 +3366,12 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         float* rw = (float*) (W.route_d + S);
         k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
         CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
-        const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= 8 && Ly.ty[0] == k::kNVFP4 &&
-                              Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4;
+        // (Q8_0 experts too with IK2_CPU_Q8=1: the last layers of unsloth's UD-Q4_K_XL)
+        const bool lane_q8 = g_cpu_q8 && Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0 && Ly.ty[2] == k::kQ8_0;
+        const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= 8 &&
+                              (lane_q8 || (Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4));
+        double& t_cpu = g_t_cpu_f[lane_q8 ? 1 : 0];
+        const double t_up = lane_q8 ? g_t_up * (34.0 / 32.0) / (36.0 / 64.0) : g_t_up;   // (the blocks' bytes a value)
         if (cpu_lane) CU(cudaMemcpyAsync(W.x_h, W.xq, TC * 4, cudaMemcpyDeviceToHost, g_s));
         CU(cudaStreamSynchronize(g_s));
         const int* top = W.route_h;
@@ -3783,13 +3841,21 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 if (EC.has(l, e)) {
                     where[i] = EC.get(Ly, l, e, tick, cst, nullptr, false, false);
                     slot_of[i] = EC.last_handle;
-                    if (EC.slot_sseq(EC.last_handle) > g_seq_done) late[i] = 1;   // still arriving from a lazy copy
+                    if (EC.slot_sseq(EC.last_handle) > g_seq_done) {   // still arriving from a lazy copy
+                        // (IK2_LAZY_CPU=1: the CPU computes it from host memory instead of the GPU waiting)
+                        if (cpu_lane && g_lazy_cpu) late[i] = 2, acc_cpu += t_cpu;
+                        else late[i] = 1;
+                    }
                     continue;
                 }
                 // a miss: the CPU's or the link's, whichever is free first
-                if (cpu_lane && acc_cpu + g_t_cpu <= acc_up + g_t_up) {
-                    late[i] = 2, acc_cpu += g_t_cpu;
-                    if (g_cpu_lazy) {   // a slot for its blocks, copied in afterwards
+                if (cpu_lane && acc_cpu + t_cpu <= acc_up + t_up) {
+                    late[i] = 2, acc_cpu += t_cpu;
+                    // (IK2_LAZY_MAX / IK2_LAZY_PER: at most that many lazy batches in flight and copies a call, so
+                    //  a narrow link is not queued up with them; past either the expert is only computed)
+                    const bool lazy_ok = g_cpu_lazy && (g_lazy_max <= 0 || (int) (g_seq_next - 1 - g_seq_done) < g_lazy_max) &&
+                                         (g_lazy_per <= 0 || n_lazy < g_lazy_per);
+                    if (lazy_ok) {   // a slot for its blocks, copied in afterwards
                         where[i] = EC.get(Ly, l, e, tick, cst, nullptr, false, false);
                         slot_of[i] = EC.last_handle;
                         lazy[n_lazy++] = i;
@@ -3798,7 +3864,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                         where[i] = nullptr, slot_of[i] = -1;
                     }
                 } else {
-                    late[i] = 1, acc_up += g_t_up;
+                    late[i] = 1, acc_up += t_up;
                     where[i] = EC.get(Ly, l, e, tick, cst, nullptr, false, false);
                     slot_of[i] = EC.last_handle;
                     urgent[n_urgent++] = i;
@@ -3817,14 +3883,16 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 const uint64_t seq = g_seq_next++;
                 if (seq > g_seq_done + kRing - 1) {   // the ring's entry is still an unfinished batch's
                     CU(cudaStreamSynchronize(g_cs));
+                    if (g_ls) CU(cudaStreamSynchronize(g_ls));
                     g_seq_done = seq - 1;
                 }
+                const cudaStream_t lst = g_ls ? g_ls : g_cs;   // (IK2_LAZY_STREAM=1: a stream of their own)
                 for (int li = 0; li < n_lazy; ++li) {
                     const int i = lazy[li];
-                    EC.copy_in(Ly, top[i], (uint8_t*) where[i], g_cs);
+                    EC.copy_in(Ly, top[i], (uint8_t*) where[i], lst);
                     EC.slot_sseq(slot_of[i]) = seq;
                 }
-                CU(cudaEventRecord(g_ring[seq % kRing], g_cs));
+                CU(cudaEventRecord(g_ring[seq % kRing], lst));
             }
             const int ps = W.pack_slot;
             W.pack_slot = (W.pack_slot + 1) % Work::kPackRing;
@@ -3850,6 +3918,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     J.down = Ly.host[2] + (size_t) e * Ly.stride[2];
                     J.x = W.x_h + (size_t) (i / c.K) * C;
                     J.sg = sg[p], J.su = su[p];
+                    J.q8 = lane_q8;
                     J.y = yh + (size_t) (p - nh - nw) * C;
                     ik2::cpu::post_expert(*g_pool, &J, C, c.F, c.gate_cap, c.up_cap);
                 }
@@ -3920,10 +3989,21 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             const float* psu = (const float*) (pk_d + 1280);
             const float* pwt = (const float*) (pk_d + 1536);
             const int F = c.F;
+            // (one token: its NVFP4 experts on the tensor cores, as the resident path runs them; IK2_EXPERT_MMA=0: no)
+            static const int exp_mma_c = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
+            const bool tc = exp_mma_c && T == 1 && nh + nw > 0 && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, F);
+            if (tc) k::to_f16_limbs(W.xq, C, (uint16_t*) W.gu32, g_s);
             for (int part = 0; part < 2; ++part) {
                 const int p0 = part ? nh : 0, n = part ? nw : nh;
                 if (part && cst != g_s) CU(cudaStreamWaitEvent(g_s, g_ev, 0));
                 if (!n) continue;
+                if (tc) {
+                    k::experts_gate_up_swiglu_mma(pb + p0, n, Ly.eb[0], (const uint16_t*) W.gu32, C, F, psg + p0,
+                                                  psu + p0, c.gate_cap, c.up_cap, W.h16 + (size_t) p0 * F, g_s);
+                    k::experts_down_mma(pb + p0, n, Ly.eb[0] + Ly.eb[1], W.h16 + (size_t) p0 * F, C, F,
+                                        W.y32 + (size_t) p0 * C, g_s);
+                    continue;
+                }
                 if (g_group && g_group_exp && T > 1) {
                     const int g0 = part ? ng[0] : 0, gc = ng[part];
                     k::experts_gate_up_swiglu_g(pgb + g0, pgn + g0, pgt + (size_t) g0 * k::kGroupMax,
@@ -3940,7 +4020,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
             if (n_jobs > 0) {
                 g_pool->wait();
-                g_t_cpu = 0.9 * g_t_cpu + 0.1 * (now() - tc0) / n_jobs;
+                g_cpu_busy += now() - tc0, ++g_cpu_batches;
+                t_cpu = 0.9 * t_cpu + 0.1 * (now() - tc0) / n_jobs;
                 CU(cudaMemcpyAsync(W.y32 + (size_t) (nh + nw) * C, yh, (size_t) n_jobs * C * 4, cudaMemcpyHostToDevice,
                                    g_s));
             }
@@ -4085,6 +4166,7 @@ int big_begin(const Model& M, Work& W, ExpertCache& EC, int n, int ctx_end, BigS
     const size_t bytes = T > W.T_sup ? big_carve(c, T, W.gu32_bytes, lg_want, W.lg_cap, nullptr, nullptr) : lg_bytes;
     const int k = (int) ((bytes + P.slot_bytes - 1) / P.slot_bytes);
     CU(cudaStreamSynchronize(g_cs));
+    if (g_ls) CU(cudaStreamSynchronize(g_ls));
     CU(cudaStreamSynchronize(g_s));
     g_seq_done = g_seq_next - 1;
     uint8_t* base = EC.lend(p, k);
@@ -4539,6 +4621,7 @@ int main(int argc, char** argv) {
         g_trace = std::fopen(getenv("IK2_TRACE"), "wb");
         if (!g_trace) die(std::string("cannot write ") + getenv("IK2_TRACE"));
     }
+    g_serve_note = serve && serve_maya;
     if (model.empty() || (toks.empty() && !serve))
         die("usage: maya-ik2 --model FIRST.gguf (--tokens 1,2,3 [--gen N] | --serve) [--chunk 2048] [--ctx N] ...");
     std::vector<int> prompt;
@@ -4705,8 +4788,18 @@ int main(int argc, char** argv) {
     //  over PCIe, and the lane measured 16.4 against 16.8 tok/s - IK2_CPU=1 to try it)
     if (getenv("IK2_CPU") && std::atoi(getenv("IK2_CPU")) && ik2::cpu::available() && threads > 1 && n_gpu == 1)
         g_pool = new ik2::cpu::Pool(threads - 1);
+    if (getenv("IK2_CPU_Q8")) g_cpu_q8 = std::atoi(getenv("IK2_CPU_Q8")) != 0;
     if (getenv("IK2_UP_MS")) g_t_up = std::atof(getenv("IK2_UP_MS")) * 1e-3;
     g_cpu_lazy = !getenv("IK2_CPU_LAZY") || std::atoi(getenv("IK2_CPU_LAZY"));
+    g_lazy_cpu = getenv("IK2_LAZY_CPU") && std::atoi(getenv("IK2_LAZY_CPU"));
+    g_lazy_max = getenv("IK2_LAZY_MAX") ? std::atoi(getenv("IK2_LAZY_MAX")) : 0;
+    g_lazy_per = getenv("IK2_LAZY_PER") ? std::atoi(getenv("IK2_LAZY_PER")) : 0;
+    if (getenv("IK2_LAZY_STREAM") && std::atoi(getenv("IK2_LAZY_STREAM")) && n_gpu == 1) {
+        int lo = 0, hi = 0;
+        CU(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+        CU(cudaStreamCreateWithPriority(&g_ls, cudaStreamNonBlocking, lo));
+    }
+    if (n_gpu > 1 && getenv("IK2_DENSE")) die("IK2_DENSE with --gpus > 1");
 
     // Do the experts all fit in VRAM beside the dense weights and the K / V cache (Inkling-2-Mini's 14.7 GiB on a 24 GB
     // card)?  Then they all stay there: the dense weights are kept as the GGUF's blocks unless IK2_DENSE says otherwise
@@ -4751,14 +4844,58 @@ int main(int argc, char** argv) {
         size_t fr0 = 0, tot0 = 0;
         CU(cudaMemGetInfo(&fr0, &tot0));
         const size_t reserve = (size_t) 3 << 29;   // (the work buffers and a quarter of a GiB of room: 1.5 GiB)
-        const bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= (size_t) (cache_gb * 1073741824.0);
+        // the drafter (--draft, loaded before the expert cache): its weights as FP16 (the file's BF16 bytes), its
+        // global layer's FP16 K / V for IK2_DRAFT_CTX positions (default the context), its windowed layers' F32 rings
+        // and its work buffers - left out, a context that fit without it pushed experts out of VRAM with it
+        size_t draft_b = 0, draft_tok = 0;
+        if (!draft_path.empty()) {
+            if (FILE* df = std::fopen(draft_path.c_str(), "rb")) {
+                std::fseek(df, 0, SEEK_END);
+                draft_b = (size_t) std::max<long>(0, std::ftell(df));
+                std::fclose(df);
+            }
+            const int want = getenv("IK2_DRAFT_CTX") ? std::atoi(getenv("IK2_DRAFT_CTX")) : 0;
+            const size_t per = (size_t) c.KV * c.D * 2 * 2;   // (a position of the global layer: K and V in FP16)
+            if (want > 0) draft_b += (size_t) std::min(ctx, std::max(want, 2048)) * per;
+            else draft_tok = per;                             // (the whole context: grows with it)
+            draft_b += (size_t) 2 * std::min(ctx, 2048) * c.KV * c.D * 8 + ((size_t) 256 << 20);
+        }
+        size_t kv_tok = 0, kv_fixed = 0;   // (the K / V bytes a context position costs, and those that do not grow)
+        for (int l = 0; l < c.n_layer; ++l) {
+            if (g_kv_managed && !c.sliding[l]) continue;
+            const size_t visit = (size_t) (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
+            if (c.sliding[l]) kv_fixed += visit * (size_t) std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock));
+            else kv_tok += visit;
+        }
+        const bool fits = exp_b + dense_b + kv_b + draft_b + (size_t) ctx * draft_tok + reserve <= fr0 &&
+                          exp_b <= (size_t) (cache_gb * 1073741824.0);
         if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
         g_fast_want = fits && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
         stage_cold = getenv("IK2_STAGE_COLD") && atoi(getenv("IK2_STAGE_COLD"));
         g_managed_experts = g_fast_want && g_kv_managed && getenv("IK2_TIER") && atoi(getenv("IK2_TIER"));
-        std::printf("experts %.1f GiB, dense weights %.1f GiB as blocks, K / V cache %.1f GiB, %.1f GiB free: %s\n",
-                    exp_b / 1073741824.0, dense_b / 1073741824.0, kv_b / 1073741824.0, fr0 / 1073741824.0,
-                    fits ? "every expert stays in VRAM" : "the experts in host memory, a cache of them in VRAM");
+        std::printf("experts %.1f GiB, dense weights %.1f GiB as blocks, K / V cache %.1f GiB%s, %.1f GiB free: %s\n",
+                    exp_b / 1073741824.0, dense_b / 1073741824.0, kv_b / 1073741824.0,
+                    draft_path.empty() ? "" : (", the drafter " + fmt_gib(draft_b + (size_t) ctx * draft_tok)).c_str(),
+                    fr0 / 1073741824.0, fits ? "every expert stays in VRAM" : "the experts in host memory, a cache of them in VRAM");
+        if (!fits && exp_b <= (size_t) (cache_gb * 1073741824.0) && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")))) {
+            // the largest context (a multiple of 4096) that would keep every expert in VRAM, if any
+            // (half a GiB more than the estimate: what the dense weights, the work buffers and the drafter take in the
+            //  end ran up to a quarter of a GiB past it on a 3090 with another process holding 1 GB of it)
+            const size_t fixed = exp_b + dense_b + kv_fixed + draft_b + reserve + ((size_t) 1 << 29), per = kv_tok + draft_tok;
+            const long fit_ctx = fr0 > fixed && per ? (long) ((fr0 - fixed) / per) / 4096 * 4096 : 0;
+            char m[400];
+            if (fit_ctx >= 4096)
+                std::snprintf(m, sizeof m, "%.1f GiB of VRAM free, %.1f GiB needed: the experts stay in host memory and "
+                              "decode runs at about half speed. --max-context %ld or lower keeps them all in VRAM",
+                              fr0 / 1073741824.0, (exp_b + dense_b + kv_b + draft_b + (size_t) ctx * draft_tok + reserve) /
+                              1073741824.0, fit_ctx);
+            else
+                std::snprintf(m, sizeof m, "%.1f GiB of VRAM free: too little to keep every expert in VRAM at any "
+                              "context; the experts stay in host memory and decode runs at about half speed",
+                              fr0 / 1073741824.0);
+            note(m);
+            g_fit_hint = m;
+        }
     } else if (g_ep) {
         // EP: each device holds its own experts (ep_owner) beside its own share of everything else - GPU 0 runs every
         // layer's attention and the dense weights, so the whole dense copy and the K / V cache are its own; GPU 1 has
@@ -5082,7 +5219,13 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < J.roles.size(); ++i) Ly.host[J.roles[i]] = p + i * Ly.eb[J.roles[i]];
             {   // (read ahead: a cold file otherwise comes in a page fault at a time)
                 const size_t pg = 4096, a0 = (size_t) p & ~(pg - 1);
-                ::madvise((void*) a0, (size_t) p - a0 + tensor_bytes(*S.info(J.name)), MADV_WILLNEED);
+                const size_t len = (size_t) p - a0 + tensor_bytes(*S.info(J.name));
+#ifdef _WIN32
+                WIN32_MEMORY_RANGE_ENTRY entry{(void*) a0, len};
+                PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+#else
+                ::madvise((void*) a0, len, MADV_WILLNEED);
+#endif
             }
         }
         std::printf("experts: read where the files are mapped (IK2_HOST=mmap)\n");
@@ -5091,12 +5234,11 @@ int main(int argc, char** argv) {
         // Pinned host memory: anonymous mappings read into and then registered with CUDA, a layer as soon as its
         // reads are done (323 GiB in ~60 s from VAST); IK2_ALLOC=hostalloc: cudaHostAlloc instead, which pins at
         // ~3 GiB/s (the driver serializes it; 110-190 s)
-#ifndef _WIN32
         bool use_mmap_reg = !(getenv("IK2_ALLOC") && std::string(getenv("IK2_ALLOC")) == "hostalloc");
         if (use_mmap_reg) {
             const size_t probe_bytes = 2ULL << 20;
-            void* mp = ::mmap(nullptr, probe_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (mp == MAP_FAILED) {
+            void* mp = ik2_anon_alloc(probe_bytes);
+            if (!mp) {
                 use_mmap_reg = false;
             } else {
                 *((volatile uint8_t*) mp) = 0;
@@ -5106,7 +5248,7 @@ int main(int argc, char** argv) {
                 } else {
                     CU(cudaHostUnregister(mp));
                 }
-                ::munmap(mp, probe_bytes);
+                ik2_anon_free(mp, probe_bytes);
             }
         }
         pin.blocks.resize(c.n_layer);
@@ -5115,9 +5257,9 @@ int main(int argc, char** argv) {
                 const Layer& Ly = M.L[l];
                 const size_t slot_bytes = Ly.eb[0] + Ly.eb[1] + Ly.eb[2];
                 const size_t layer_bytes = (size_t) c.E * slot_bytes;
-                void* p = ::mmap(nullptr, layer_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                if (p == MAP_FAILED) {
-                    for (int k = 0; k < l; ++k) ::munmap(pin.blocks[k].ptr, pin.blocks[k].bytes);
+                void* p = ik2_anon_alloc(layer_bytes);
+                if (!p) {
+                    for (int k = 0; k < l; ++k) ik2_anon_free(pin.blocks[k].ptr, pin.blocks[k].bytes);
                     pin.blocks.assign(c.n_layer, {});
                     use_mmap_reg = false;
                     break;
@@ -5125,10 +5267,6 @@ int main(int argc, char** argv) {
                 pin.blocks[l] = {p, layer_bytes, true, false};
             }
         }
-#else
-        bool use_mmap_reg = false;
-        pin.blocks.resize(c.n_layer);
-#endif
         // (pinned: the allocations and the reads overlap - a layer's reads start as soon as its buffer exists;
         // IK2_ALLOC_THREADS threads allocate, default 1)
         std::vector<std::atomic<int>> ready(c.n_layer);
@@ -5442,7 +5580,10 @@ int main(int argc, char** argv) {
     CU(cudaMemGetInfo(&fr, &tot));
     // (what is left free: 2 GiB beside a cache that streams experts in and out; a quarter of one when every expert
     //  stays in VRAM - nothing more is allocated but a token's graph)
-    const size_t room = g_fast_want ? (size_t) 256 << 20 : (size_t) 2 << 30;
+    // (IK2_ROOM_MIB overrides the streaming reserve: an 8 GB card has no 2 GiB to spare beside the cache)
+    const size_t room = getenv("IK2_ROOM_MIB") ? (size_t) std::max(0, atoi(getenv("IK2_ROOM_MIB"))) << 20
+                        : g_fast_want         ? (size_t) 256 << 20
+                                              : (size_t) 2 << 30;
     const size_t budget = std::min((size_t) (cache_gb * 1073741824.0), fr > room ? fr - room : (size_t) 0);
     EC.tp = g_tp ? d : -1;
     EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget);
@@ -5537,7 +5678,27 @@ int main(int argc, char** argv) {
             std::printf("resident: every expert in VRAM (%d copied in %.1f s); tokens take the resident path%s\n", n,
                         now() - tw, g_graph ? ", a CUDA graph each" : "");
         } else {
-            std::printf("resident path off: %s\n", all ? "a dense matrix is not kept as blocks" : "the cache does not hold every expert");
+            if (!all) {   // (the estimate said yes, the VRAM left after the dense weights and the drafter said no)
+                size_t short_b = 0;
+                int have = 0, want = 0;
+                for (const auto& P : EC.pools) {
+                    have += P.n_active, want += P.n_layers * c.E;
+                    if (P.n_active < P.n_layers * c.E) short_b += (size_t) (P.n_layers * c.E - P.n_active) * P.slot_bytes;
+                }
+                size_t per = 0;   // (the K / V bytes of a context position)
+                for (int l = 0; l < c.n_layer; ++l)
+                    if (!c.sliding[l] && !g_kv_managed)
+                        per += (size_t) (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
+                const long less = per ? (long) ((short_b + ((size_t) 256 << 20)) / per + 4095) / 4096 * 4096 : 0;
+                char m[400];
+                std::snprintf(m, sizeof m, "resident path off: the expert cache holds %d of %d experts (%.2f GiB short)%s;"
+                              " decode runs at about half speed%s. --max-context %ld or lower keeps them all in VRAM",
+                              have, want, short_b / 1073741824.0, drafter ? " beside the drafter" : "",
+                              drafter ? " and the drafter is off" : "", std::max(4096L, (long) ctx - less));
+                note(m);
+            } else {
+                std::printf("resident path off: a dense matrix is not kept as blocks\n");
+            }
         }
     }
     std::fflush(stdout);
@@ -5659,7 +5820,9 @@ int main(int argc, char** argv) {
             }
             return v;
         };
+#ifdef SIGUSR1
         std::signal(SIGUSR1, on_usr1);
+#endif
         // Maya's protocol (serve/server.py's StrataEngine): "GEN <max_new> [key=value ...] <ids>" in; "PP ..." per
         // prompt pass, "T <id>" per token and "DONE <generated> <prompt> <prompt_ms> <decode_ms> <stop|length|cancel>
         // 0 0 <reused>" out; "STOP" mid-request ends it at the next token (or between the prompt's passes), "QUIT"
@@ -5669,7 +5832,7 @@ int main(int argc, char** argv) {
             eos_ids.push_back(199999);   // (Inkling 2's <|endoftext|>)
         }
         if (serve_maya) {
-            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d\n", g_kv_fp8 ? "fp8" : "f16", ctx, n_gpu);
+            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d resident=%d\n", g_kv_fp8 ? "fp8" : "f16", ctx, n_gpu, g_fast ? 1 : 0);
             std::printf("READY %d stop\n", ctx);
         } else {
             std::printf("@READY ctx %d\n", ctx);
@@ -6415,6 +6578,9 @@ int main(int argc, char** argv) {
         for (int slot = 0; slot < 8; ++slot) sum += g_p2wacc[slot], std::printf(" %s %.2f", g_p2name[slot], g_p2wacc[slot] / g_p2w_wins);
         std::printf(" | sum %.2f, the forward %.2f\n", sum / g_p2w_wins, g_p2w_wall * 1e3 / g_p2w_wins);
     }
+    if (g_pool && g_cpu_batches)
+        std::printf("CPU lane batches: %ld, %.1f us each, Q8_0 %.2f ms a job\n", g_cpu_batches,
+                    g_cpu_busy / g_cpu_batches * 1e6, g_t_cpu_f[1] * 1e3);
     if (g_prof)
         std::printf("profile (all calls): attention %.2f s, router %.2f s, uploads %.2f s, experts %.2f s, rest %.2f s\n",
                     g_pf.attn, g_pf.route, g_pf.upload, g_pf.experts, g_pf.rest);

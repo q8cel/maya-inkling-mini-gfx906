@@ -1379,6 +1379,7 @@ class InklingRewriter:
         self.open = thinking         # the parser is in its reasoning state (it starts there when thinking)
         self.name = ""
         self.body = ""
+        self.repaired = 0            # calls read from the loose shapes (_loose)
 
     def feed(self, text: str) -> str:
         self.buf += text
@@ -1445,6 +1446,38 @@ class InklingRewriter:
             self.mode = "between"
         return out
 
+    # The call's JSON as Inkling-2-Mini sometimes writes it: {"name":"read_file"args":{...}} - the comma and the quote
+    # before "args" left out (its own top pick there on some prompts, llama.cpp's too: llama.cpp's chat endpoint hides
+    # it with its tool-call grammar) - or, sampled, a stray token in their place, or no "args" key at all.  The call's
+    # JSON is only ever {"name": .., "args": {..}} and the name is whole, so the first JSON object after it (or its
+    # members written without the opening brace) is read as the arguments; anything after them but the closing brace
+    # makes it text, as does a body cut off inside.  The name alone: the call with no arguments (the client's tool
+    # then says what is missing, where text would end an agent's turn).
+    _HEAD = re.compile(r'\s*\{\s*"name"\s*:\s*"((?:[^"\\]|\\.)*)"')
+    _ARGS_KEY = re.compile(r'\s*(?:,\s*)?"?args"?\s*:\s*')
+    _JUNK = re.compile(r'[^{}"\[\]]{0,8}"?\s*:?\s*')   # (a stray token or two where ,"args": belongs)
+    _TAIL = re.compile(r"\s*\}?\s*")
+
+    def _loose(self):
+        """(name, args) from a call body json.loads refused, when it is one of the shapes above; else None."""
+        m = self._HEAD.match(self.body)
+        if not m:
+            return None
+        name, rest = json.loads('"' + m.group(1) + '"'), self.body[m.end():]
+        if self._TAIL.fullmatch(rest):
+            return name, {}
+        k = self._ARGS_KEY.match(rest) or self._JUNK.match(rest)
+        at = rest[k.end():]
+        dec = json.JSONDecoder()
+        for text in ((at,) if at.startswith("{") else ("{" + at,) if at.startswith('"') else ()):
+            try:
+                args, end = dec.raw_decode(text)
+            except ValueError:
+                return None
+            if isinstance(args, dict) and self._TAIL.fullmatch(text[end:]):
+                return name, args
+        return None
+
     def _call(self) -> str:
         try:
             j = json.loads(self.body)
@@ -1453,7 +1486,11 @@ class InklingRewriter:
             if not name or not isinstance(args, dict):
                 raise ValueError(self.body)
         except ValueError:
-            return self._close() + self.body   # (not a call the parser can read: its text, as the answer's)
+            loose = self._loose()
+            if loose is None or not (loose[0] or self.name.strip()):
+                return self._close() + self.body   # (not a call the parser can read: its text, as the answer's)
+            name, args = loose[0] or self.name.strip(), loose[1]
+            self.repaired += 1
         val = lambda v: json.dumps(v, ensure_ascii=False).replace("<", "\\u003c")   # ("<" occurs in strings only)
         return (self._close() + CALL_START + name +
                 "".join(ARG_KEY + k + ARG_KEY_END + ARG_VAL + val(v) + ARG_VAL_END for k, v in args.items()) + CALL_END)

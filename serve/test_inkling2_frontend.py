@@ -183,6 +183,35 @@ class Parser(unittest.TestCase):
                     with self.subTest(name=name, thinking=thinking, step=step):
                         self.assertEqual(self.feed(text, thinking, step), (reasoning, content, calls))
 
+    def test_loose_call_json(self):   # (issue #2: the comma and the quote before "args" left out)
+        body = '{"name":"get_weather"args":{"city":"Paris","days":2}}'
+        text = MODEL + THINK + "Let me do that." + END + MODEL + "get_weather" + CALL + body + END + EOS
+        for step in (1, 3, 1000):
+            with self.subTest(step=step):
+                self.assertEqual(self.feed(text, True, step),
+                                 ("Let me do that.", "", [("get_weather", {"city": "Paris", "days": 2})]))
+        for loose in ('{"name":"get_weather",args":{"city":"Rome"}}', '{"name": "get_weather" "args": {"city": "Rome"}',
+                      '{"name":"get_weather"args:{"city":"Rome"}}', '{"name":"get_weather"\u602c":{"city":"Rome"}}',
+                      '{"name":"get_weather"\u55dc":"city":"Rome"}}', '{"name":"get_weather"{"city":"Rome"}}'):
+            with self.subTest(body=loose):
+                self.assertEqual(self.feed(MODEL + "get_weather" + CALL + loose + END + EOS, False, 1000),
+                                 ("", "", [("get_weather", {"city": "Rome"})]))
+        # the name alone (its message ended, or the answer at an end token): the call with no arguments
+        for end in (END + EOS, ""):
+            self.assertEqual(self.feed(MODEL + "get_weather" + CALL + '{"name":"get_weather"' + end, False, 4),
+                             ("", "", [("get_weather", {})]))
+
+    def test_unreadable_call_stays_text(self):
+        for body in ('{"name":"get_weather"args":{"city":"Pa', '{"name":"get_weather"args":{"city":"Paris"}} and more',
+                     '{"name":"get_weather"args":"Paris"}', 'not json at all'):
+            with self.subTest(body=body):
+                r = InklingRewriter(thinking=False)
+                out = r.feed(MODEL + "get_weather" + CALL + body + END) + r.finish()
+                self.assertEqual((out, r.repaired), (body, 0))
+        r = InklingRewriter(thinking=False)   # (cut off inside the name: text)
+        out = r.feed(MODEL + "get_weather" + CALL + '{"name":"get_wea') + r.finish()
+        self.assertEqual(out, '{"name":"get_wea')
+
     def test_unfinished_call_is_text(self):
         r = InklingRewriter(thinking=False)
         out = r.feed(MODEL + "get_weather" + CALL + '{"name":"get_weather","args":{"ci') + r.finish()
@@ -231,7 +260,7 @@ class Serving(unittest.TestCase):
         msgs, tools, kw = openai_to_messages({"messages": [PICTURE]})
         with self.assertRaises(ValueError) as e:
             svc.prepare(msgs, tools, kw, 100)
-        self.assertIn("Inkling-2-Small on maya-ik2 reads text only", str(e.exception))
+        self.assertIn("on maya-ik2 reads text only without the image encoder", str(e.exception))
         self.assertEqual(eng.prompts, [])
 
     def test_logprobs_and_bias_are_refused(self):   # (an engine whose INFO names neither)

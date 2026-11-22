@@ -3,20 +3,8 @@
 #include "ik2_kernels.cuh"
 
 #include <cuda_fp16.h>
+#ifndef _WIN32
 #include <fcntl.h>
-
-#ifdef _WIN32
-#include <io.h>
-#include <BaseTsd.h>
-typedef SSIZE_T ssize_t;
-#define O_RDONLY (_O_RDONLY | _O_BINARY)
-#define open _open
-#define close _close
-static inline ssize_t pread(int fd, void* buf, size_t count, int64_t offset) {
-    if (_lseeki64(fd, offset, SEEK_SET) == -1) return -1;
-    return _read(fd, buf, (unsigned int)count);
-}
-#else
 #include <unistd.h>
 #endif
 
@@ -119,6 +107,16 @@ std::vector<uint16_t> st_bf16(const StFile& f, const std::string& name, const st
     if (it->second.shape != shape) throw std::runtime_error("drafter: " + name + ": unexpected shape");
     const size_t n = (it->second.end - it->second.begin) / 2;
     std::vector<uint16_t> v(n);
+#ifdef _WIN32
+    FILE* fp = std::fopen(f.path.c_str(), "rb");
+    if (!fp) throw std::runtime_error("drafter: cannot open " + f.path);
+    if (_fseeki64(fp, (int64_t) (f.data0 + it->second.begin), SEEK_SET) != 0 ||
+        std::fread(v.data(), 2, n, fp) != n) {
+        std::fclose(fp);
+        throw std::runtime_error("drafter: read failed");
+    }
+    std::fclose(fp);
+#else
     const int fd = ::open(f.path.c_str(), O_RDONLY);
     size_t done = 0;
     while (done < n * 2) {
@@ -127,6 +125,7 @@ std::vector<uint16_t> st_bf16(const StFile& f, const std::string& name, const st
         done += (size_t) r;
     }
     ::close(fd);
+#endif
     return v;
 }
 

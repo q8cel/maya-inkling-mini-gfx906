@@ -61,7 +61,7 @@ To pick the card, set `CUDA_VISIBLE_DEVICES` before the command.
 
 ## Configs
 
-All 4 are in [`docs/inkling2-mini/`](inkling2-mini/).
+All 4 are in [`docs/inkling2-mini/`](inkling2-mini/). For a card with 8 GB, see [An 8 GB card](#an-8-gb-card).
 
 | Config | Context | Drafter | Image encoder | VRAM |
 |---|---:|---|---|---:|
@@ -69,6 +69,16 @@ All 4 are in [`docs/inkling2-mini/`](inkling2-mini/).
 | `ik2-mini-long.json` | 344,064 | no | CPU | 23.3 GiB at start, 23.6 at 340K tokens |
 | `ik2-mini-text.json` | 344,064 | no | none | the same |
 | `ik2-mini-gpu-vision.json` | 262,144 | no | GPU, 1.3 GiB | 23.7 GiB |
+
+**Check that every expert stays in VRAM.** The VRAM column is with nothing else on the card. If another program
+holds some of it, the configs above may not fit, and then the experts stay in host memory and decode runs at 50
+to 80 tok/s instead of 125. The engine says so when it starts, and the server prints the line:
+
+    [maya] maya-ik2: 22.3 GiB of VRAM free, 22.7 GiB needed: the experts stay in host memory and decode runs at about
+    half speed. --max-context 200704 or lower keeps them all in VRAM
+
+Set `--max-context` to that number, or free the VRAM. A start with every expert in VRAM prints `resident: every
+expert in VRAM` in the engine's log, and `INFO ... resident=1`.
 
 The context is the prompt, the image tokens and the answer together. A smaller `--max-context` frees VRAM: the FP8 KV cache of the 8 layer visits without a window takes 16 KB per token, 5.5 GiB at 344,064. The drafter holds 0.7 GiB of weights plus 4 KB per position of the context its global layer sees (`IK2_DRAFT_CTX`, 65,536 in the config).
 
@@ -131,6 +141,21 @@ llama.cpp `b12590` with the Inkling 2 pull requests, same card and file: 57.0 to
 
 Decode slows down with depth for a physical reason. 8 of the 48 layer visits attend over the full prefix, so every new token reads 16 KB of cache per token of context: 5.4 GB at 340K, on top of the 3.7 GB of weights.
 
+## An 8 GB card
+
+[`ik2-mini-8gb.json`](inkling2-mini/ik2-mini-8gb.json) runs the same file on a card that holds a quarter of the experts. The experts stay in pinned host memory (14.7 GiB of RAM), the GPU keeps a 3.8 GiB cache of them, and the CPU computes each missing expert from host memory while the GPU runs the cached ones. Measured on a laptop with an RTX 5070 Laptop GPU (8 GB, PCIe 4.0 x8), a Ryzen 9 270 (AVX-512) and DDR5 that reads at 58 GB/s: 40 to 43 tok/s through the server on five chat prompts of 500 to 600 tokens, at a 16,384 token context. llama.cpp with its experts on the CPU gets 12.5 tok/s on the same laptop.
+
+| Setting | What it does |
+|---|---|
+| `IK2_ROOM_MIB=256` | The VRAM left free beside the cache: 256 MiB instead of 2 GiB |
+| `IK2_DENSE=q8` | The dense weights as the GGUF's Q8_0 blocks: half the VRAM of the FP16 copy, which leaves more room for the cache |
+| `IK2_UP_MS=5` | A copy over PCIe priced so high that the CPU computes every miss. A narrow link stalls the GPU on each copy |
+| `IK2_CPU_Q8=1` | The CPU computes the Q8_0 experts of layers 20 to 23 too. Without it, a miss there waits for an 8 MB copy |
+| `IK2_LAZY_CPU=1` | An expert still arriving from a background copy goes to the CPU, so the GPU does not wait for it |
+| `IK2_LAZY_MAX=2`, `IK2_LAZY_PER=1` | At most 2 background copies in flight and 1 started per layer visit. The cache still follows the text: 84% hits against 49% with no copies |
+
+The limits on that laptop: the CPU computes a miss at 37 to 41 GB/s of the 58 GB/s the RAM gives, and the GPU kernels of a token take about 15 ms. A longer context leaves less VRAM for the cache, so 32,768 tokens give about 36 tok/s and 65,536 about 32.
+
 ## How it works
 
 Inkling 2 Mini is a 26B MoE: 24 layers of weights, 128 experts each (8 per token), and layers 6 to 17 run 3 times, which makes 48 layer visits per token. 40 visits use a sliding window of 1,024 keys, 8 see everything.
@@ -164,6 +189,10 @@ What I tried that didn't help:
 * 399 forced tokens of real text with an FP16 cache, tensor core experts against scalar: median KL 5.7e-5, the same top token on 394. The model is sensitive on this text: the tensor core attention against its scalar kernel gives 1.7e-4 and 393.
 * The drafter's window against the general prompt path on the same tokens, FP16 cache: KL about 5e-8 per row (up to 5e-4 at near router ties). 96 GSM8K questions, greedy: 77 solved with the drafter, 74 without.
 * An FP8 cache against FP16: median KL 1.1e-3. Any 2 FP8 runs drift apart within a few tokens, because a difference of 1e-5 flips codes of a 3-bit mantissa. That is the cache format, not a bug.
+* Tool calls: the model sometimes writes its call as `{"name":"read_file"args":{...}}`, with the comma and the quote
+  before `args` left out. llama.cpp writes the same call on the same prompt (its chat endpoint hides it with a
+  tool-call grammar), and an FP8 cache flips into it on a few more prompts. The server reads such a call as the call
+  it is ([#2](https://github.com/alesha-pro/maya-inkling-mini/issues/2)).
 * The float64 reference `ref/inkling2.py` agrees with llama.cpp on 47 of 47 top tokens, and the engine with the reference on 45 to 46 of 47.
 
 ## What else is in the tree
@@ -172,4 +201,4 @@ The branch also carries experimental code that the configs above leave off: a 1,
 
 ## Credits
 
-[Project Maya](https://github.com/mw00/project-maya) by Peasant Smith and the Maya contributors is the base, and `maya-ik2` began as the Inkling 2 Small engine of Maya's pull requests #981 and #1079. [Strata](https://github.com/Niko1221/Strata) by Niko1221 is where Maya came from. The model is by [Thinking Machines](https://huggingface.co/thinkingmachines/Inkling-2-Mini), the GGUF by [Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), ggml and `mtmd` by the llama.cpp authors. The Windows / CUDA 13 build and two-GPU expert parallel are by [@cobra91](https://github.com/cobra91).
+[Project Maya](https://github.com/mw00/project-maya) by Peasant Smith and the Maya contributors is the base, and `maya-ik2` began as the Inkling 2 Small engine of Maya's pull requests #981 and #1079. [Strata](https://github.com/Niko1221/Strata) by Niko1221 is where Maya came from. The model is by [Thinking Machines](https://huggingface.co/thinkingmachines/Inkling-2-Mini), the GGUF by [Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), ggml and `mtmd` by the llama.cpp authors. The Windows / CUDA 13 build and two-GPU expert parallel are by [@cobra91](https://github.com/cobra91). The Windows fixes on top are by [@PrasoonPratham](https://github.com/PrasoonPratham), the 8 GB card path by [@ImagineNotChetng](https://github.com/ImagineNotChetng).

@@ -2690,6 +2690,11 @@ Engine flags: `--max-context N` (262144), `--cache-gb N` (60: the expert cache's
 | `IK2_EP_SPLIT` | `0.55` | GPU 1's share of the picks under `IK2_EP` (GPU 0 also holds the dense weights and the cache of the KV) |
 | `IK2_TP` | off | `1` with `--gpus 2`: the experts tensor parallel instead (each GPU half of every expert): decode 42.8 vs EP's 41.3 tok/s, prompts slower |
 | `IK2_CPU` | off | `1`: in decode, a missing NVFP4 expert computed on the CPU (AVX-512) when that is sooner than its copy over PCIe (H200 node, with `IK2_CPU_LAZY=0`: 34.5 -> 36.2 tok/s); one GPU only. `IK2_CPU_LAZY=0`: such an expert is not copied into the cache afterwards either (the link carries less) |
+| `IK2_CPU_Q8` | off | `1`: with `IK2_CPU`, missing Q8_0 experts (UD-Q4_K_XL's layers 20 to 23) are computed on the CPU too, not only NVFP4 ones |
+| `IK2_LAZY_CPU` | off | `1`: with `IK2_CPU`, an expert still arriving from a background (lazy) copy is computed on the CPU instead of the GPU waiting for it |
+| `IK2_LAZY_MAX`, `IK2_LAZY_PER` | 0, 0 (no limit) | the background copies in flight (batches) and the copies started in one layer visit; past either, a miss is only computed on the CPU. For a narrow PCIe link (8 GB laptop config: 2 and 1) |
+| `IK2_LAZY_STREAM` | off | `1`: the background copies on a stream of their own |
+| `IK2_ROOM_MIB` | 2048 (256 when every expert stays in VRAM) | the VRAM left free beside the expert cache |
 | `IK2_SUP` | 16384 (4096 when VRAM is short) | the tokens of one layer-major prompt pass (each pass copies every expert it misses once); a pass's scratch (~280 KB a token) comes out of the expert cache |
 | `IK2_PF_P` | `0.999` | the prompt prefetch: an expert is copied ahead when the chance that some token of the layer picks it is at least this |
 | `IK2_WGMMA` | on | `0`: the mma.sync attention on Hopper too (the wgmma one needs a build with sm_90a) |

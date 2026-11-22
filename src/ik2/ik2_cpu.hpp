@@ -39,6 +39,8 @@ private:
 
 /// out[r - r0] = W[r] . x for rows r0 .. r1 - 1 of an NVFP4 matrix (rows of K values, K % 64 == 0).
 void nvfp4_rows(const uint8_t* W, int K, int r0, int r1, const float* x, float* out);
+/// The same for a Q8_0 matrix (ggml's 34-byte blocks: an FP16 scale, then 32 int8 values; K % 32 == 0).
+void q8_0_rows(const uint8_t* W, int K, int r0, int r1, const float* x, float* out);
 
 /// One NVFP4 expert: gate, up [F][C] and down [C][F] blocks, x [C]; y [C] = down . h, h = gcap tanh(g / gcap)
 /// sigmoid(g) ucap tanh(u / ucap), g = (gate . x) sg, u = (up . x) su - the raw sums of down (its scale is the
@@ -47,6 +49,7 @@ struct ExpertJob {
     const uint8_t *gate = nullptr, *up = nullptr, *down = nullptr;
     const float* x = nullptr;
     float sg = 1.0f, su = 1.0f;
+    bool q8 = false;   // the three matrices are Q8_0 instead of NVFP4
     float* y = nullptr;
     std::vector<float> gu, h;
     std::atomic<int> left{0};

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace ik2::cpu {
 
@@ -146,7 +147,68 @@ void nvfp4_rows_scalar(const uint8_t* W, int K, int r0, int r1, const float* x, 
     }
 }
 
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx512f,avx512bw,avx512vl,fma,f16c")))
+void q8_0_rows_avx512(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
+    const int nb = K / 32;
+    const size_t rb = (size_t) nb * 34;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* b = W + (size_t) r * rb;
+        __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+        const float* xp = x;
+        for (int i = 0; i < nb; ++i, b += 34, xp += 32) {
+            uint16_t h;
+            std::memcpy(&h, b, 2);
+            const __m512 d = _mm512_set1_ps(_cvtsh_ss(h));
+            const __m512 v0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i*) (b + 2))));
+            const __m512 v1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i*) (b + 18))));
+            acc0 = _mm512_fmadd_ps(v0, _mm512_mul_ps(_mm512_loadu_ps(xp), d), acc0);
+            acc1 = _mm512_fmadd_ps(v1, _mm512_mul_ps(_mm512_loadu_ps(xp + 16), d), acc1);
+        }
+        out[r - r0] = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+    }
+}
+#endif
+
+float fp16_to_f32(uint16_t h) {
+    const uint32_t s = (uint32_t) (h & 0x8000) << 16, e = (h >> 10) & 0x1F, m = h & 0x3FF;
+    if (e == 0) return (s ? -1.0f : 1.0f) * std::ldexp((float) m, -24);
+    if (e == 31) return m ? NAN : (s ? -INFINITY : INFINITY);
+    const uint32_t bits = s | ((e + 112) << 23) | (m << 13);
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
+void q8_0_rows_scalar(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
+    const int nb = K / 32;
+    const size_t rb = (size_t) nb * 34;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* b = W + (size_t) r * rb;
+        double acc = 0.0;
+        for (int i = 0; i < nb; ++i, b += 34) {
+            uint16_t h;
+            std::memcpy(&h, b, 2);
+            float a = 0.0f;
+            for (int j = 0; j < 32; ++j) a += (float) (int8_t) b[2 + j] * x[i * 32 + j];
+            acc += (double) fp16_to_f32(h) * a;
+        }
+        out[r - r0] = (float) acc;
+    }
+}
+
 }  // namespace
+
+void q8_0_rows(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    static const bool fast = available();
+    if (fast) {
+        q8_0_rows_avx512(W, K, r0, r1, x, out);
+        return;
+    }
+#endif
+    q8_0_rows_scalar(W, K, r0, r1, x, out);
+}
 
 void nvfp4_rows(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
@@ -163,27 +225,30 @@ void post_expert(Pool& pool, ExpertJob* job, int C, int F, float gcap, float uca
     job->gu.resize((size_t) 2 * F);
     job->h.resize(F);
     const int n = std::max(1, pool.size());
-    job->left = 2 * n;   // gate's chunks and up's
     auto down = [&pool, job, C, F, n]() {
         for (int c = 0; c < n; ++c) {
             const int r0 = (int) ((long) C * c / n), r1 = (int) ((long) C * (c + 1) / n);
-            pool.post([job, F, r0, r1]() { nvfp4_rows(job->down, F, r0, r1, job->h.data(), job->y + r0); });
-        }
-    };
-    for (int part = 0; part < 2; ++part)
-        for (int c = 0; c < n; ++c) {
-            const int r0 = (int) ((long) F * c / n), r1 = (int) ((long) F * (c + 1) / n);
-            pool.post([job, C, F, gcap, ucap, part, r0, r1, down]() {
-                nvfp4_rows(part ? job->up : job->gate, C, r0, r1, job->x, job->gu.data() + (size_t) part * F + r0);
-                if (--job->left == 0) {   // the last chunk: the activation, then down's rows
-                    for (int i = 0; i < F; ++i) {
-                        const float g = job->gu[i] * job->sg, u = job->gu[(size_t) F + i] * job->su;
-                        job->h[i] = gcap * std::tanh(g / gcap) * (1.0f / (1.0f + std::exp(-g))) * ucap * std::tanh(u / ucap);
-                    }
-                    down();
-                }
+            pool.post([job, F, r0, r1]() {
+                (job->q8 ? q8_0_rows : nvfp4_rows)(job->down, F, r0, r1, job->h.data(), job->y + r0);
             });
         }
+    };
+    job->left = n;   // the chunks of gate and up rows, each with its rows' activation
+    for (int c = 0; c < n; ++c) {
+        const int r0 = (int) ((long) F * c / n), r1 = (int) ((long) F * (c + 1) / n);
+        pool.post([job, C, F, gcap, ucap, r0, r1, down]() {
+            auto rows = job->q8 ? q8_0_rows : nvfp4_rows;
+            float* g = job->gu.data();
+            float* u = job->gu.data() + F;
+            rows(job->gate, C, r0, r1, job->x, g + r0);
+            rows(job->up, C, r0, r1, job->x, u + r0);
+            for (int i = r0; i < r1; ++i) {
+                const float gs = g[i] * job->sg, us = u[i] * job->su;
+                job->h[i] = gcap * std::tanh(gs / gcap) * (1.0f / (1.0f + std::exp(-gs))) * ucap * std::tanh(us / ucap);
+            }
+            if (--job->left == 0) down();   // the last chunk: down's rows, which need all of h
+        });
+    }
 }
 
 }  // namespace ik2::cpu

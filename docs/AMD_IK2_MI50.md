@@ -2,6 +2,9 @@
 
 This describes branch `hip/gfx906-mi50`: the port itself is commit `0d14c59942` (stage 1 plus the two-card
 expert-parallel work) and the branch tip adds the device-side pick split, this document and the README line.
+The branch is synced with upstream `e819852` (the `c520fd1` base plus eight commits: the Windows/MSVC and 8 GB
+card paths, the expert-fit note, the tokenizer test names and a single-token EP expert MMA path); the merge kept
+the HIP guards described below.
 
 The Inkling-2 engine (`src/ik2`) built for AMD Instinct MI50 / MI60 (Vega 20, `gfx906`, wave64) with ROCm 6.4.
 Two cards run the experts in parallel (`IK2_EP=1`); every layer's attention, dense weights, K / V cache and taps
@@ -63,7 +66,34 @@ The 32K decode figure is the final build's (`attn_split_gqa_kernel`, below). The
 (30.0 ms/token) on a cool machine: a sustained hour of load costs ~20 % of this kernel's throughput (the
 context-independent sections drift ~4 % in the same window), so treat 32.2-33.4 tok/s as the spread.
 
-Deterministic: greedy output repeats across runs. **EP is bit-identical to a single GPU in attention, not in the
+### After the upstream sync (`e819852`)
+
+The merge re-applied the HIP guards on upstream's new code; all three targets build for gfx906 and
+`ik2_kernels_test` is **344 checks, 0 failures**. Newly disabled by HIP: upstream's single-token EP expert fast path
+now calls `experts_gate_up_swiglu_mma` / `experts_down_mma` (on unless `IK2_EXPERT_MMA=0`) when `experts_mma_fits`
+accepts the expert types; on HIP that predicate returns false, so the EP token path keeps the limb (`__dp4a`)
+kernels. Both MMA entry points are stubs that abort with a clear message, so naming them directly fails loudly
+instead of launching nothing. Upstream's other additions are device-agnostic and run unchanged on HIP:
+`IK2_CPU_Q8`, `IK2_LAZY_CPU` / `_MAX` / `_PER` / `_STREAM` (single GPU), `IK2_ROOM_MIB`, the drafter-aware fit
+message and the `resident=` field of the server's `INFO` line. The new `n_gpu > 1 && IK2_DENSE` refusal matches this
+port's EP-only two-card model.
+
+Measured after the merge (two runs each, same box and commands as the table above):
+
+| | run A | run B |
+|---|---:|---:|
+| decode, 512-id README prompt, 64 tokens | 43.02 tok/s | 43.18 tok/s |
+| prefill of that prompt | 363.6 tok/s | 362.4 tok/s |
+| decode, 32768-id prompt, 32 tokens | 34.54 tok/s | 34.59 tok/s |
+| prefill of that prompt | 435.8 tok/s | 441.7 tok/s |
+
+That is inside the pre-sync spread (the table's 42.7 tok/s on 511 README ids; the 32K logs above range 30.2-34.8
+tok/s), so the merge did not regress plain decode. The 512-id smoke produced 64 ids each time, but the two runs
+parted at token 27 on a near tie (`197020` against `196978`) - the run-to-run drift already noted; the 32768-id run
+repeated the same 31 ids both times (`69201 69057 220 ...`).
+
+Deterministic across runs except at near ties (a reduction-order flip can pick the other token; the post-sync
+512-id smoke parted at one): greedy output repeats. **EP is bit-identical to a single GPU in attention, not in the
 experts.** Measured on a 255-id prompt taken a token at a time (`--chunk 1`, the decode path) with both attention
 dispatch modes, against one GPU: the first visit's attention output is bit-identical (`attn_out`, worst |Δ| = 0.0,
 `IK2_ATTN_GQA` 0 and 1), while that visit's MoE output already differs (`out` 1.5e-4 scalar attention / 1.9e-4 GQA)
