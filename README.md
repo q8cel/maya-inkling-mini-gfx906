@@ -77,6 +77,7 @@ The engine computes the model the GGUF holds, no pruning and no requantizing. On
 * The drafter helps code, edits and structured text. On free prose it accepts about 2 tokens per window and the engine mostly decodes plain.
 * The image encoder runs on the CPU in the default configs. A new image takes about 4.5 s on a 48-core EPYC, the same image again 0.5 s.
 * Tested on RTX 3090s with the `gpu-unlock` kernel module, Ubuntu 22.04, driver 610.43. Windows builds since @cobra91's port; other cards are untested.
+* Community HIP/gfx906 port on 2 × MI50 (expert parallel only, scalar attention and limb (`__dp4a`) expert kernels, no tensor cores): 44.2 tok/s decode at a 255-token context and 414–442 tok/s prefill against llama.cpp's 30.4 / 359–389 there; the drafter and the image encoder are off. [docs/AMD_IK2_MI50.md](docs/AMD_IK2_MI50.md).
 
 ## About this repo
 

@@ -257,6 +257,9 @@ struct Layer {
     const uint8_t** tab_blob = nullptr;
     float* tab_sc[3] = {};
     std::vector<const uint8_t*> tab_h;             // (tab_blob on the host: a short prompt's groups)
+    // expert parallel: each device's own [E] resident table (its owned experts; a slot the other GPU owns is null)
+    const uint8_t** tab_blob_d[2] = {};
+    float* tab_sc_d[2][3] = {};
     // the state: of the visit being run (bind_visit)
     uint16_t *kc = nullptr, *vc = nullptr;         // FP16 [kv_cap][KV * D] (IK2_KV=f16)
     uint8_t *kc8 = nullptr, *vc8 = nullptr;        // FP8 E4M3 [kv_cap][KV * D] (IK2_KV=fp8)
@@ -376,6 +379,11 @@ inline bool dual() { return g_ep || g_tp; }
 // attention, the dense weights and the KV cache). With IK2_WARM's profile each layer's experts are dealt by how often
 // they are picked, so the two GPUs' shares come out as asked; without it by a hash of the expert.
 std::vector<uint8_t> g_ep_own;
+// expert parallel, device-side picks: each device's copy of ep_owner, the cache-miss snapshot the resident tables were
+// built at (a later miss rebuilds them), and whether both devices' tables are complete
+uint8_t* g_ep_own_d[2] = {};
+uint64_t g_ep_tab_miss[2] = {~0ull, ~0ull};
+bool g_ep_split = false;
 inline int ep_owner(int l, int e) { return g_ep_own[(size_t) l * g_pop_E_ep + e]; }
 bool g_flash = true;   // IK2_FLASH=0: the prefill's attention (FP16 KV) through the logits in memory and cuBLAS, not fused
 int g_n_sm = 0;
@@ -3053,6 +3061,54 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
     ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, m - 1);
 }
 
+// EP's resident tables, both devices: each owned expert's slot on the device that owns it (by expert), its gate/up/down
+// scales and the owner table the pick split reads.  A device whose cache does not hold every expert it owns leaves the
+// tables incomplete (false) and the host round trip in place.  Rebuilt when a device's cache has taken anything in
+// since (a prompt's prefill may evict what the tables named).
+static bool ep_build_tables(Model& M) {
+    const Config& c = M.c;
+    bool ok = g_ep && !g_tp;
+    for (int d = 0; d < 2 && ok; ++d) {   // every expert this device owns is in its cache
+        ExpertCache& EC = dev_cache(d);
+        ok = !EC.pools.empty();
+        for (int l = 0; l < c.n_layer && ok; ++l)
+            for (int e = 0; e < c.E && ok; ++e)
+                if (ep_owner(l, e) == d && EC.loc[(size_t) l * c.E + e] < 0) ok = false;
+    }
+    if (ok) {
+        for (int d = 0; d < 2; ++d) {
+            use_dev(d);
+            ExpertCache& EC = dev_cache(d);
+            if (!g_ep_own_d[d]) {
+                g_ep_own_d[d] = dalloc<uint8_t>((size_t) c.n_layer * c.E);
+                CU(cudaMemcpy(g_ep_own_d[d], g_ep_own.data(), (size_t) c.n_layer * c.E, cudaMemcpyHostToDevice));
+            }
+            for (int l = 0; l < c.n_layer; ++l) {
+                Layer& Ly = M.L[l];
+                const auto& P = EC.pools[EC.layer_pool[l]];
+                if (!Ly.tab_blob_d[d]) {
+                    Ly.tab_blob_d[d] = dalloc<const uint8_t*>(c.E);
+                    for (int r = 0; r < 3; ++r) Ly.tab_sc_d[d][r] = dalloc<float>(c.E);
+                }
+                std::vector<const uint8_t*> tab(c.E, nullptr);
+                std::vector<float> sc[3];
+                for (int r = 0; r < 3; ++r) sc[r].assign(c.E, 1.0f);
+                for (int e = 0; e < c.E; ++e) {
+                    const int sl = EC.loc[(size_t) l * c.E + e];
+                    if (sl >= 0) tab[e] = P.data + (size_t) sl * P.slot_bytes;
+                    for (int r = 0; r < 3; ++r)
+                        if (!Ly.scale[r].empty()) sc[r][e] = Ly.scale[r][e];
+                }
+                CU(cudaMemcpy(Ly.tab_blob_d[d], tab.data(), (size_t) c.E * sizeof(void*), cudaMemcpyHostToDevice));
+                for (int r = 0; r < 3; ++r)
+                    CU(cudaMemcpy(Ly.tab_sc_d[d][r], sc[r].data(), (size_t) c.E * 4, cudaMemcpyHostToDevice));
+            }
+        }
+        use_dev(0);
+    }
+    g_ep_tab_miss[0] = dev_cache(0).misses, g_ep_tab_miss[1] = dev_cache(1).misses;
+    return ok;
+}
 void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode out_mode, const std::string& dump,
              std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
     k::enable_grouped_tensor_products(allow_short_batch_products());
@@ -3064,6 +3120,9 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
     }
     if (out_mode == OutMode::kCand) out_mode = OutMode::kLogits, g_cand.n = -1;   // (this path: the logits)
     use_dev(M.L[0].dev);
+    // (a prompt's prefill may evict what the resident EP tables named: rebuild them when a cache has taken anything in)
+    if (g_ep && !g_tp && T == 1 && (dev_cache(0).misses != g_ep_tab_miss[0] || dev_cache(1).misses != g_ep_tab_miss[1]))
+        g_ep_split = ep_build_tables(M);
     Work* Wp = &dev_work(g_cur);
     ExpertCache* ECp = &dev_cache(g_cur);
 #define W (*Wp)
@@ -3299,13 +3358,52 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
+        // The limb (dp4a) kernels for a pick's gate | up | down when its types are the ones they take: NVFP4 whole, or
+        // Q8_0 whole (the input rows go in as two 8-bit limbs, 15 bits of the F32 input); else the row kernels.
+        const bool q8_limb = Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0 && Ly.ty[2] == k::kQ8_0;
+        const bool nv_limb = Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4;
+        // The resident EP split: both devices hold every expert they own, so their slots are addressed on the device
+        // and the picks never reach the host.  GPU 1 gets the 8 picks (64 B) and the input over, its own picks' slots
+        // from its own table; the combine's rows and weights are built on GPU 0; no sync, no packs.
+        if (g_ep_split && T == 1 && g_overlap && !g_prof && (q8_limb || nv_limb) && C % 64 == 0 && c.F % 64 == 0) {
+            const double te0 = now();
+            const int F = c.F;
+            CU(cudaEventRecord(g_ep_x, g_dev[0].s));   // (after this layer's routing: the picks are on GPU 0)
+            for (int d = 1; d >= 0; --d) {
+                use_dev(d);
+                Work& Wd = dev_work(d);
+                if (d == 1) {
+                    CU(cudaStreamWaitEvent(g_s, g_ep_x, 0));
+                    CU(cudaMemcpyPeerAsync(Wd.route_d, 1, dev_work(0).route_d, 0, (size_t) S * 8, g_s));
+                    CU(cudaMemcpyPeerAsync(Wd.xq, 1, dev_work(0).xq, 0, (size_t) C * 4, g_s));
+                }
+                const int* top_d = Wd.route_d;
+                const float* w_d = (const float*) (Wd.route_d + S);
+                k::ep_pick_table(top_d, w_d, g_ep_own_d[d], l, c.E, k::kEpRows, d, Ly.tab_blob_d[d], Ly.tab_sc_d[d][0],
+                                 Ly.tab_sc_d[d][1], Ly.tab_sc_d[d][2], Wd.blob, Wd.sg, Wd.su,
+                                 d == 0 ? W.inv : nullptr, d == 0 ? W.wt : nullptr, g_s);
+                k::expert_limb_mv(true, Wd.blob, Ly.eb[0], C, F, k::kEpRows, Wd.xq, Wd.h16, nullptr, Wd.sg, Wd.su,
+                                  c.gate_cap, c.up_cap, Wd.gu32, g_s, q8_limb, false);
+                k::expert_limb_mv(false, Wd.blob, Ly.eb[0] + Ly.eb[1], C, F, k::kEpRows, Wd.xq, Wd.h16, Wd.y32, nullptr,
+                                  nullptr, 0.0f, 0.0f, Wd.gu32, g_s, q8_limb, false);
+                if (d == 1) {
+                    CU(cudaMemcpyPeerAsync(dev_work(0).y32 + (size_t) k::kEpRows * C, 0, Wd.y32, 1,
+                                           (size_t) k::kEpRows * C * 4, g_s));
+                    CU(cudaEventRecord(g_ep_done, g_s));
+                }
+            }
+            use_dev(0);
+            CU(cudaStreamWaitEvent(g_s, g_ep_done, 0));
+            k::moe_combine_f32(W.y32, W.inv, W.wt, T, c.K, C, W.tmp, false, g_s);
+            t_exp += now() - te0;
+            conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
+            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
+            continue;
+        }
         if (g_ep && T == 1 && g_overlap && !g_prof) {
             const double te0 = now();
             const int F = c.F;
-            // The limb (dp4a) kernels for a pick's gate | up | down when its types are the ones they take: NVFP4 whole,
-            // or Q8_0 whole (the input rows go in as two 8-bit limbs, 15 bits of the F32 input); else the row kernels.
-            const bool q8_limb = Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0 && Ly.ty[2] == k::kQ8_0;
-            const bool nv_limb = Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4;
             const bool limb = g_ep_limb && (nv_limb || q8_limb) && C % 64 == 0 && F % 64 == 0;
             int row_of[16], n_d[2] = {0, 0};
             const uint8_t* blob_d[2][16];
@@ -5221,6 +5319,12 @@ int main(int argc, char** argv) {
         }
     }
     std::fflush(stdout);
+    }
+    if (g_ep && !g_tp) {
+        g_ep_split = ep_build_tables(M);
+        std::printf("resident EP: %s\n",
+                    g_ep_split ? "every owned expert in VRAM; a token's picks are split on the device (no host round trip)"
+                               : "the host round trip each layer (a device's cache does not hold every expert it owns)");
     }
     if (g_managed_experts) {
         CU(cudaStreamSynchronize(g_s));

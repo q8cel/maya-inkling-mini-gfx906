@@ -2645,6 +2645,7 @@ template <bool Gate, bool Q8>
 __global__ void nv_limb_mv(const uint8_t* const* blobs, const NvInput* packed, size_t offset, int C, int F,
                            const float* sg, const float* su, float gcap, float ucap, uint16_t* hidden, float* y) {
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, slot = blockIdx.y;
+    if (!blobs[slot]) return;   // (a slot this GPU does not own: the pick is the other device's)
     const int K = Gate ? C : F, N = Gate ? F : C;
     const int r = (blockIdx.x * (blockDim.x / 32) + warp) * (Gate ? 1 : 2);
     if (r >= N) return;
@@ -5731,6 +5732,28 @@ void expert_limb_mv(bool gate, const uint8_t* const* blob, size_t offset, int C,
                 <<<dim3((C + 7) / 8, S), 128, 0, stream>>>(blob, p, offset, C, F, nullptr, nullptr, 0, 0, nullptr, y);
     }
     check("nv_expert_limb");
+}
+__global__ void ep_pick_table_kernel(const int* top, const float* w, const uint8_t* own, int l, int E, int S, int d,
+                                     const uint8_t* const* tab, const float* sg, const float* su, const float* sc2,
+                                     const uint8_t** blob, float* sg_out, float* su_out, int* rows, float* wts) {
+    const int i = threadIdx.x;
+    if (i >= kEpRows) return;
+    const bool has = i < S;
+    const int e = has ? top[i] : 0;
+    const int owner = has ? (own ? own[(size_t) l * E + e] : 0) : -1;
+    // (a pick this device does not own is a null slot: the limb kernels skip it, and the combine reads the other
+    //  device's rows instead)
+    blob[i] = (tab && owner == d) ? tab[e] : nullptr;
+    if (sg_out) sg_out[i] = has ? (sg ? sg[e] : 1.0f) : 1.0f;
+    if (su_out) su_out[i] = has ? (su ? su[e] : 1.0f) : 1.0f;
+    if (rows) rows[i] = has ? (owner ? kEpRows : 0) + i : 0;
+    if (wts) wts[i] = has ? w[i] * (sc2 ? sc2[e] : 1.0f) : 0.0f;
+}
+void ep_pick_table(const int* top, const float* w, const uint8_t* own, int l, int E, int S, int d,
+                   const uint8_t* const* tab, const float* sg, const float* su, const float* sc2,
+                   const uint8_t** blob, float* sg_out, float* su_out, int* rows, float* wts, cudaStream_t s) {
+    ep_pick_table_kernel<<<1, 32, 0, s>>>(top, w, own, l, E, S, d, tab, sg, su, sc2, blob, sg_out, su_out, rows, wts);
+    check("ep_pick_table");
 }
 bool experts_mma_fits(int ty_gate, int ty_up, int ty_down, int C, int F) {
 #if defined(STRATA_USE_HIP)

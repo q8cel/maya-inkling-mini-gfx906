@@ -187,6 +187,15 @@ void expert_limb_mv(bool gate, const uint8_t* const* blob, size_t offset, int C,
 ///   down:    y [S][C] = down . h[s] (h [S][F] FP16), raw sums
 void experts_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
                      const float* x, int C, int F, float* gu, cudaStream_t s);
+/// The expert-parallel pair's rows a pick can have on one GPU: the token's K picks each take their pick index as the
+/// slot (an unowned pick is a null slot), so GPU 1's rows start at this offset in the combined y.
+constexpr int kEpRows = 8;
+/// One GPU's half of a token's picks, from the device only: the picks' resident slots on this device (null for the ones
+/// it does not own), their gate/up scales and - GPU 0's - the combine's rows (its own picks at 0 .. kEpRows - 1, GPU 1's
+/// at kEpRows ..) and weights.  own: ep_owner [n_layer][E]; tab: this device's [E] slots; sg/su/sc2: its [E] scales.
+void ep_pick_table(const int* top, const float* w, const uint8_t* own, int l, int E, int S, int d,
+                   const uint8_t* const* tab, const float* sg, const float* su, const float* sc2,
+                   const uint8_t** blob, float* sg_out, float* su_out, int* rows, float* wts, cudaStream_t s);
 /// One token's NVFP4 experts through the tensor cores (slot s: blob[s]; gate | up | down as above): the input in
 /// FP16 (gate / up: x as two limbs, x16 [2][C] = hi, lo with x = hi + lo - to_f16_limbs, or route_token's x_limbs;
 /// down: h [S][F]), a code times its scale exact in FP16, the sum FP32.  C and F multiples of 64.
