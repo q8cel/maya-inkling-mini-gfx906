@@ -280,6 +280,12 @@ void attn_decode_fp8(const float* q, const float* r, const float* sink, const ui
                      int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale,
                      float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
                      float* out, cudaStream_t s, const float* gate = nullptr, uint16_t* out16 = nullptr);
+/// The split attention kernel the HIP build launches: -1 the build's default (the GQA split kernel where it takes
+/// the shape, else the scalar one, and IK2_ATTN_GQA=0 turns GQA off), 0 the scalar attn_split_kernel, 1 the GQA
+/// kernel (HIP only: the CUDA build has no GQA path and this is a no-op there).  The tests use it to compare the
+/// two on the same inputs.
+void attn_gqa_mode(int mode);
+
 /// Unwrap nk KV rows starting at k0 from FP8 ring buffer into contiguous FP16 [nk, KD] scaled by k_inv_scale / v_inv_scale.
 void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk, int KD,
                           float k_inv_scale, float v_inv_scale, uint16_t* k_out16, uint16_t* v_out16,

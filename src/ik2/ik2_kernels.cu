@@ -12,6 +12,12 @@
 #include <cstring>
 
 namespace ik2::k {
+
+// (the HIP GQA split kernel's dispatch, attn_gqa_mode's and IK2_ATTN_GQA's: -1 the build's default, 0 the scalar
+// attn_split_kernel, 1 the GQA kernel)
+int g_attn_gqa = -1;
+void attn_gqa_mode(int mode) { g_attn_gqa = mode; }
+
 namespace {
 
 void check(const char* what) {
@@ -3627,6 +3633,192 @@ __global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, 
     pp[2 + tid] = o;
 }
 
+#if defined(STRATA_USE_HIP)
+// ---- one K / V head a block, its G = H / Hkv query heads in one pass over the keys (HIP/gfx906)
+//
+// attn_split_kernel runs a block a query head, so the three query heads of a K / V head read - and FP8-decode -
+// every K / V row three times (at 32K that is 192 MiB a layer-visit, and the FP8 decode of a byte is a third of
+// the instructions a key costs). This block reads a row once for all of them. Every per-head quantity repeats
+// attn_flash_range's operations in its order - the lane -> 4-dimension mapping, the four-term dot, the xor
+// butterfly reduce, the keys a warp takes - so a partial is bit-identical to the scalar path's.
+
+// E4M3 -> f16 a byte, as e4m3fn_to_f16 has it, tabulated in LDS (512 B): the scalar form is a branch a stage and
+// two dozen instructions, and an FP8 row is four bytes a lane.
+__device__ __forceinline__ void fp8_lut_fill(uint16_t* tbl, int tid, int nthr) {
+    for (int i = tid; i < 256; i += nthr) tbl[i] = e4m3fn_to_f16((uint8_t) i);
+}
+
+// a lane's four dimensions of one K / V row: the four the lane's dot takes, in one 16-byte load
+template <class KV>
+__device__ __forceinline__ float4 kv_row4(const KV* row, int lane, const uint16_t* tbl);
+template <>
+__device__ __forceinline__ float4 kv_row4<float>(const float* row, int lane, const uint16_t*) {
+    return __ldg((const float4*) row + lane);
+}
+template <>
+__device__ __forceinline__ float4 kv_row4<uint16_t>(const uint16_t* row, int lane, const uint16_t*) {
+    const uint2 v = __ldg((const uint2*) row + lane);
+    const float2 a = u32_to_f2(v.x), b = u32_to_f2(v.y);
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+template <>
+__device__ __forceinline__ float4 kv_row4<uint8_t>(const uint8_t* row, int lane, const uint16_t* tbl) {
+    const uint32_t w = __ldg((const uint32_t*) row + lane);
+    const float2 a = u32_to_f2((uint32_t) tbl[w & 0xFFu] | ((uint32_t) tbl[(w >> 8) & 0xFFu] << 16));
+    const float2 b = u32_to_f2((uint32_t) tbl[(w >> 16) & 0xFFu] | ((uint32_t) tbl[w >> 24] << 16));
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+
+// (MASKED: some key of [k0, k0 + nk) can lie outside the window; RING: the cache is the sliding layers' ring)
+#pragma clang fp contract(on)
+template <class KV, int G, bool MASKED, bool RING>
+__global__ void attn_split_gqa_kernel(const float* q, const float* r, const KV* kc, const KV* vc, int kv_cap, int H,
+                                      int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj,
+                                      int d_rel, int extent, int window, float* part) {
+    __shared__ uint16_t sm_tbl[256];
+    __shared__ float sm_m[G][4], sm_s[G][4];
+    __shared__ __align__(16) float sm_o[G][4][128];
+    const int g = blockIdx.x, p = blockIdx.y, P = gridDim.y, qi = blockIdx.z, tid = threadIdx.x;
+    const int KD = Hkv * 128, qpos = qpos0 + qi, hb = g * G;
+    const int len = (nk + P - 1) / P, j0 = p * len, j1 = min(nk, j0 + len);
+    const int lane = tid & 31, warp = tid >> 5, o = lane * 4;
+    if (sizeof(KV) == 1) fp8_lut_fill(sm_tbl, tid, (int) blockDim.x);
+    __syncthreads();
+    float4 q4[G];
+    float rl[G];
+    const float* qh0 = q + ((size_t) qi * H + hb) * 128;
+    const bool qv4 = ((uintptr_t) qh0 & 15) == 0;
+#pragma unroll
+    for (int i = 0; i < G; ++i) {
+        const float* qh = qh0 + (size_t) i * 128;
+        q4[i] = qv4 ? __ldg((const float4*) (qh + o)) : make_float4(qh[o], qh[o + 1], qh[o + 2], qh[o + 3]);
+        const float* rh = r + ((size_t) qi * H + hb + i) * d_rel;
+        rl[i] = (lane < d_rel) ? __ldg(rh + lane) : 0.0f;
+    }
+    float mw[G], sw[G];
+    float4 ow[G];
+#pragma unroll
+    for (int i = 0; i < G; ++i) mw[i] = -INFINITY, sw[i] = 0.0f, ow[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const int KDg = g * 128;
+    int j = j0 + warp, slot = 0;
+    if (RING) slot = (k0 + j) % kv_cap;
+    for (; j < j1; j += 4) {
+        const int pos = k0 + j, dist = qpos - pos;
+        bool vis = true;
+        if (MASKED) vis = dist >= 0 && dist < window;
+        if (vis) {
+            const size_t head_off = (size_t) (RING ? slot : pos) * KD + KDg;
+            const float4 k4 = kv_row4(kc + head_off, lane, sm_tbl);
+            const float4 v4 = kv_row4(vc + head_off, lane, sm_tbl);
+            float l[G];
+#pragma unroll
+            for (int i = 0; i < G; ++i) {
+                const float a = q4[i].x * k4.x + q4[i].y * k4.y + q4[i].z * k4.z + q4[i].w * k4.w;
+                l[i] = wsum(a) * qk_scale;
+            }
+            if (dist < extent) {   // (the bias row is the same for the G heads; only their r differs)
+                const float pv = (lane < d_rel) ? __ldg(proj + (size_t) dist * d_rel + lane) : 0.0f;
+#pragma unroll
+                for (int i = 0; i < G; ++i) l[i] += wsum(rl[i] * pv);
+            }
+#pragma unroll
+            for (int i = 0; i < G; ++i) {
+                // (attn_flash_range's update, a head at a time; skipping the alpha of a held max - the branch and
+                //  its code measured slower than the expf, so it is always computed here)
+                if (l[i] > -INFINITY) {
+                    const float mn = fmaxf(mw[i], l[i]);
+                    const float al = (mw[i] == -INFINITY) ? 0.0f : expf(mw[i] - mn);
+                    const float be = expf(l[i] - mn);
+                    mw[i] = mn;
+                    sw[i] = sw[i] * al + be;
+                    ow[i].x = ow[i].x * al + v4.x * be;
+                    ow[i].y = ow[i].y * al + v4.y * be;
+                    ow[i].z = ow[i].z * al + v4.z * be;
+                    ow[i].w = ow[i].w * al + v4.w * be;
+                }
+            }
+        }
+        if (RING) {
+            slot += 4;
+            if (slot >= kv_cap) slot -= kv_cap;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < G; ++i) {
+        if (lane == 0) sm_m[i][warp] = mw[i], sm_s[i][warp] = sw[i];
+        *(float4*) (&sm_o[i][warp][o]) = ow[i];
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < G; ++i) {   // (attn_split_kernel's four-warp merge, a head at a time)
+        const float M = fmaxf(fmaxf(sm_m[i][0], sm_m[i][1]), fmaxf(sm_m[i][2], sm_m[i][3]));
+        float sum = 0.0f, oo = 0.0f;
+        if (M > -INFINITY) {
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                if (sm_m[i][w] == -INFINITY) continue;
+                const float f = expf(sm_m[i][w] - M);
+                sum += sm_s[i][w] * f;
+                oo += sm_o[i][w][tid] * f;
+            }
+        }
+        float* pp = part + (((size_t) qi * H + hb + i) * P + p) * 130;
+        if (tid == 0) pp[0] = M, pp[1] = sum;
+        pp[2 + tid] = oo;
+    }
+}
+#pragma clang fp contract(off)
+
+template <class KV, int G>
+void attn_split_gqa_go(const float* q, const float* r, const KV* kc, const KV* vc, int kv_cap, int nq, int H,
+                       int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj, int d_rel, int extent,
+                       int window, float* part, int P, bool masked, cudaStream_t s) {
+    const dim3 gr((unsigned) Hkv, (unsigned) P, (unsigned) nq);
+    if (kv_cap > 0) {
+        if (masked)
+            attn_split_gqa_kernel<KV, G, true, true><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0,
+                                                                       qk_scale, proj, d_rel, extent, window, part);
+        else
+            attn_split_gqa_kernel<KV, G, false, true><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0,
+                                                                        qk_scale, proj, d_rel, extent, window, part);
+    } else {
+        if (masked)
+            attn_split_gqa_kernel<KV, G, true, false><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0,
+                                                                        qk_scale, proj, d_rel, extent, window, part);
+        else
+            attn_split_gqa_kernel<KV, G, false, false><<<gr, 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk,
+                                                                         qpos0, qk_scale, proj, d_rel, extent, window,
+                                                                         part);
+    }
+}
+
+// the GQA split kernel for this shape, or false to leave the launch to attn_split_kernel
+template <class KV>
+bool attn_split_gqa_launch(const float* q, const float* r, const KV* kc, const KV* vc, int kv_cap, int nq, int H,
+                           int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj, int d_rel,
+                           int extent, int window, float* part, int& P, cudaStream_t s) {
+    const bool gqa_on =
+        g_attn_gqa >= 0 ? g_attn_gqa != 0
+                        : !(std::getenv("IK2_ATTN_GQA") && std::atoi(std::getenv("IK2_ATTN_GQA")) == 0);
+    if (!gqa_on) return false;
+    const int G = Hkv > 0 ? H / Hkv : 0;
+    if (Hkv <= 0 || H % Hkv != 0 || (G != 3 && G != 6)) return false;
+    if (d_rel > 32 || ((int) sizeof(KV) * (Hkv * 128)) % 16) return false;
+    if ((((uintptr_t) kc | (uintptr_t) vc) & 15) != 0) return false;
+    if (kv_cap > 0 && kv_cap < 4) return false;
+    // (a token's keys all in its window: the mask check is off then, and the kernel drops it)
+    const bool masked = qpos0 + nq - 1 - k0 >= window || qpos0 - (k0 + nk - 1) < 0;
+    // a split a head pair, not a query head: G times the splits to launch the blocks the scalar path does
+    P = std::max(1, std::min(std::min(128, P * G), std::max(nk, 1)));
+    if (G == 3) attn_split_gqa_go<KV, 3>(q, r, kc, vc, kv_cap, nq, H, Hkv, k0, nk, qpos0, qk_scale, proj, d_rel,
+                                         extent, window, part, P, masked, s);
+    else attn_split_gqa_go<KV, 6>(q, r, kc, vc, kv_cap, nq, H, Hkv, k0, nk, qpos0, qk_scale, proj, d_rel, extent,
+                                  window, part, P, masked, s);
+    check("attn_split_gqa");
+    return true;
+}
+#endif  // defined(STRATA_USE_HIP)
+
 __global__ void attn_combine_kernel(const float* sink, const float* part, int H, int P, float v_inv_scale, float* out,
                                     const float* gate = nullptr, uint16_t* out16 = nullptr) {
     const int h = blockIdx.x, qi = blockIdx.y, tid = threadIdx.x;
@@ -5948,8 +6140,16 @@ void attn_multi_impl(const float* q, const float* r, const float* sink, const KV
         std::fprintf(stderr, "ik2::k::attn_multi: d_rel %d\n", d_rel);
         std::abort();
     }
-    const int P = std::min(128, std::max(1, (nk + 63) / 64));
+    int P = std::min(128, std::max(1, (nk + 63) / 64));   // (a HIP GQA launch raises it: a split a head pair)
     float* part = scratch;
+#if defined(STRATA_USE_HIP)
+    if (attn_split_gqa_launch<KV>(q, r, kc, vc, kv_cap, nq, H, Hkv, k0, nk, qpos0, qk_scale, proj, d_rel, extent,
+                                  window, part, P, s)) {
+        attn_combine_kernel<<<dim3(H, nq), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out);
+        check("attn_multi_combine");
+        return;
+    }
+#endif
     attn_split_kernel<KV><<<dim3(H, P, nq), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0, qk_scale, proj,
                                                           d_rel, extent, window, part, nullptr);
     check("attn_multi_split");
@@ -6009,7 +6209,7 @@ void attn_decode_impl(const float* q, const float* r, const float* sink, const K
     // Flash-Decode splits over chunks of 32 keys, up to 128 blocks per head (partials written directly to scratch).
     // A 255-key split costs 31 us a token at 32 keys, 42 at 64 and 75 at 128 (gfx906, FP8, 48 heads); past 4096 keys
     // the 128-block cap binds and the split is the deep context's (128 x 64 keys at 32 keys a block).
-    const int P = std::min(128, std::max(1, (nk + 31) / 32));
+    int P = std::min(128, std::max(1, (nk + 31) / 32));   // (a HIP GQA launch raises it: a split a head pair)
     if (P == 1 && !gate) {
         attn_decode_kernel<KV><<<H, 128, 0, s>>>(q, r, sink, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale,
                                                    v_inv_scale, proj, d_rel, extent, window, out);
@@ -6017,6 +6217,14 @@ void attn_decode_impl(const float* q, const float* r, const float* sink, const K
         return;
     }
     float* part = scratch;
+#if defined(STRATA_USE_HIP)
+    if (attn_split_gqa_launch<KV>(q, r, kc, vc, kv_cap, 1, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel, extent, window,
+                                  part, P, s)) {
+        attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out, gate, out16);
+        check("attn_decode_combine");
+        return;
+    }
+#endif
     attn_split_kernel<KV><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel,
                                                       extent, window, part, nullptr);
     check("attn_decode_split");

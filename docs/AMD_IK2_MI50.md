@@ -54,13 +54,26 @@ experts + 3.4 GiB dense + 2.2 GiB KV + work ≈ 14.4 of 15.8 GiB free, GPU 1 7.4
 | decode, 255-token context (CLI, 64 tokens) | 30.4 tok/s | **44.2 tok/s** (22.6 ms/token) |
 | decode, 255-token context (server, 51-token prompt) | | **45.5 tok/s** |
 | decode, 5.1K-token context (server) | | 39.5 tok/s |
-| decode, 32K-token context (CLI) | | **31.7 tok/s** (31.6 ms/token) |
+| decode, 32K-token context (CLI) | | **32.2 tok/s** (31.1 ms/token) |
 | prefill, 512 / 32768 tokens (CLI) | 359–389 tok/s | **414 / 442 tok/s** |
 | prefill, 5152 tokens (server) | | **644.9 tok/s** |
-| `ik2_kernels_test` | | **322 checks, 0 failures** (4 mma.sync tests skipped by name) |
+| `ik2_kernels_test` | | **328 checks, 0 failures** (4 mma.sync tests skipped by name) |
 
-Deterministic: greedy output is the same across runs and modes. EP is bit-identical to a single GPU: 0 of 96
-per-layer dump files differ (48 visits × `out` + `attn_out`), worst |Δ| = 0.0, expert picks identical.
+The 32K decode figure is the final build's (`attn_split_gqa_kernel`, below). The same binary measured 33.4 tok/s
+(30.0 ms/token) on a cool machine: a sustained hour of load costs ~20 % of this kernel's throughput (the
+context-independent sections drift ~4 % in the same window), so treat 32.2-33.4 tok/s as the spread.
+
+Deterministic: greedy output repeats across runs. **EP is bit-identical to a single GPU in attention, not in the
+experts.** Measured on a 255-id prompt taken a token at a time (`--chunk 1`, the decode path) with both attention
+dispatch modes, against one GPU: the first visit's attention output is bit-identical (`attn_out`, worst |Δ| = 0.0,
+`IK2_ATTN_GQA` 0 and 1), while that visit's MoE output already differs (`out` 1.5e-4 scalar attention / 1.9e-4 GQA)
+and the difference grows to 7.3 / 12.6 on the log-probs over 48 visits (102 / 107 of 145 dump files differ, expert
+picks identical in 42 / 37 of the 48 visits — the picks follow the residual stream, they do not lead it). The cause
+is the expert kernels, not attention: a two-card decode runs the EP block's limb (`__dp4a`) `expert_limb_mv` where
+one GPU runs the row kernels (`IK2_EXPERT_LIMB` defaults to 0). It is **pre-existing**: with the branch-tip scalar
+attention (`IK2_ATTN_GQA=0`) the counts are the same 102 / 145 and the greedy stream of that prompt already differs
+between EP and one GPU. An earlier revision's "0 of 96 files differ, worst |Δ| = 0.0, expert picks identical" does
+not reproduce on this build; the configuration it held under is not recorded here.
 
 ## Two cards: expert parallel only
 
@@ -74,8 +87,9 @@ once (logits by 18), measured. EP keeps every layer whole on GPU 0 and splits on
 
 * **Tensor-core attention and experts** (`mma.sync m16n8k16`, Hopper `wgmma`, `cp.async`, `ldmatrix`,
   `q8_tile`, the grouped-block kernels): PTX, compiled out under `STRATA_USE_HIP`; their launchers abort with
-  `maya-ik2: <fn>: tensor-core path not built for HIP/gfx906`. The scalar split attention and the limb
-  (`__dp4a`) expert kernels run instead. `IK2_FLASH=1`, `IK2_ATTN_MMA=1`, `IK2_BLOCK=1`, `IK2_EXPERT_MMA=1`
+  `maya-ik2: <fn>: tensor-core path not built for HIP/gfx906`. The GQA split attention
+  (`attn_split_gqa_kernel`), the scalar split attention it falls back to, and the limb (`__dp4a`) expert kernels
+  run instead. `IK2_FLASH=1`, `IK2_ATTN_MMA=1`, `IK2_BLOCK=1`, `IK2_EXPERT_MMA=1`
   are refused at startup rather than run.
 * **The block path** (a verify window's attention, `attn_block_mma`) and CUDA graphs: off (`IK2_GRAPH=0`).
 * **The drafter** (`--draft`): loads and runs on two cards with EP, but its proposals are degenerate (8 % of
@@ -94,14 +108,24 @@ warm; the per-GPU fill is 0.6 s; `READY` follows. Keep the GGUF page-cached for 
 1. The token loop's per-kernel pipeline gap: the attention phase measures ~13.8 ms a token against ~6 ms of
    kernel service in isolation, and is not the context footprint (8192 vs 131072 changes nothing). The
    device-side pick split removed the per-layer host round trip and its packs (**+0.6–0.8 ms a token**:
-   43.4 → 44.2 tok/s at 255 tokens, 31.0 → 31.7 at 32K). What remains is the gap between kernels: graph
-   capture would attack it, but capturing across two devices is the blocker; per-layer, two-device graphs are
-   the untested alternative.
+   43.4 → 44.2 tok/s at 255 tokens, 31.0 → 31.7 at 32K — the table above has the current figures). What remains
+   is the gap between kernels: graph capture would attack it, but capturing across two devices is the blocker;
+   per-layer, two-device graphs are the untested alternative.
 2. `attn_res_rms_f16` costs ~25 µs a call with an idle queue (one block of 512 threads, latency-bound; the
    isolated pipelined figure is 11.7 µs). The ~10 µs around each of the two calls a visit — and the same gap
    on every other small kernel — is the pipeline overhead above, not kernel time.
-3. The deep-context attention kernel: 8.1 ms a token at 32K (63 GB/s effective; 24 query heads re-read each
-   K / V head 3×). A wave64 variant with 16-byte K/V loads is the likely shape.
+3. Deep-context attention: 10.05 -> 6.3-7.5 ms a token at 32K with the GQA split kernel (`attn_split_gqa_kernel`
+   in `src/ik2/ik2_kernels.cu`): a block a K / V head, its `H / Hkv` (3 here) query heads in one pass over the
+   keys, so each K / V row is read and FP8-decoded once instead of three times, 16-byte loads, the E4M3 decode
+   from a 256-entry LDS table, and the sliding layers' ring index incremental instead of a per-key divide.
+   `IK2_ATTN_GQA=0` runs the previous scalar `attn_split_kernel` (bit-identical to the branch tip). `test_attn_gqa`
+   in `tests/ik2_kernels_test.cu` compares the two on the same K / V for H 24 / KV 8 (full, ring), H 48 / KV 8
+   (GQA 6, masked ring) and an FP16 cache, and checks that a shape no GQA kernel takes (H 16 / KV 4) stays on the
+   scalar path bit for bit; `attn_gqa_mode()` is the hook it switches them with. That is the 3x fewer K / V reads;
+   what is left is issue count and latency (IPC 0.57 against the scalar path's 0.94): 6 `expf` a key (13
+   instructions each, kept for bit-exactness), three 32-lane xor butterflies (15 `ds_bpermute` + waits), and the
+   LDS table read feeding the dot. Next shapes: a warp taking 4 keys with 8-lane reduces (9 shuffles per 4 keys),
+   or `exp2f` (2 instructions) if a last-bit change is acceptable.
 4. Planar Q8 dense (`IK2_DENSE=q8`) works with EP and halves the dense bytes a token reads (42.9 → 43.2
    tok/s) but a prefill chunk then dequantizes every projection per pass (421 → 209 tok/s): opt-in only.
 5. The drafter's `propose`, and a sampler-aware accept rule before it can reach the server.

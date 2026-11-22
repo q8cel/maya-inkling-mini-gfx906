@@ -2182,6 +2182,99 @@ void test_fp8_kv() {
     }
 }
 
+// The HIP GQA split kernel (a block a K/V head, the G heads of it in one pass over the keys) against the scalar
+// split kernel it replaces, on the same K / V / q / r / sink: the two differ by a reduction order, so this pins
+// that difference for the shape the model runs (H 24 / KV 8), for shapes it does not (GQA 6), and for a head
+// count that is not a multiple of the K / V heads - which must stay on the scalar path, bit for bit.
+void test_attn_gqa() {
+#if defined(STRATA_USE_HIP)
+    const int D = 128, d_rel = 16, ctx = 3100, extent = 1024;
+    const float k_inv = 1.0f / 16.0f, v_inv = 1.0f / 32.0f, scale = 1.0f / std::sqrt(128.0f);
+    struct Case {
+        int H, KV, k0, nk, qpos, kv_cap, window;
+        const char* name;
+    };
+    const Case cases[] = {
+        {24, 8, 0, 2500, 2499, 0, 1 << 30, "attn gqa / scalar: H24 KV8 full"},
+        {24, 8, 1477, 1024, 2500, 1056, 1024, "attn gqa / scalar: H24 KV8 ring 1056"},
+        {48, 8, 1477, 1031, 2507, 1056, 1024, "attn gqa / scalar: H48 KV8 GQA 6, masked ring"},
+        {16, 4, 0, 700, 699, 0, 1 << 30, "attn gqa / scalar: H16 KV4 (GQA 4: scalar path)"},
+    };
+    for (const Case& c : cases) {
+        std::vector<uint8_t> kc_lin((size_t) ctx * c.KV * D), vc_lin((size_t) ctx * c.KV * D);
+        for (size_t i = 0; i < kc_lin.size(); ++i) {   // (E4M3's whole finite range, subnormals included)
+            uint8_t bk = (uint8_t) (rng() & 0xFFu), bv = (uint8_t) (rng() & 0xFFu);
+            if ((bk & 0x7F) >= 0x7E) bk = (bk & 0x80u) | 0x60u;
+            if ((bv & 0x7F) >= 0x7E) bv = (bv & 0x80u) | 0x60u;
+            kc_lin[i] = bk, vc_lin[i] = bv;
+        }
+        std::vector<uint8_t> kc = kc_lin, vc = vc_lin;
+        if (c.kv_cap > 0) {   // the ring view of the same rows: position pos at slot pos % kv_cap
+            kc.assign((size_t) c.kv_cap * c.KV * D, 0), vc.assign(kc.size(), 0);
+            for (int pos = c.k0; pos < c.k0 + c.nk; ++pos) {
+                const int slot = pos % c.kv_cap;
+                std::memcpy(&kc[(size_t) slot * c.KV * D], &kc_lin[(size_t) pos * c.KV * D], (size_t) c.KV * D);
+                std::memcpy(&vc[(size_t) slot * c.KV * D], &vc_lin[(size_t) pos * c.KV * D], (size_t) c.KV * D);
+            }
+        }
+        auto q = fvec((size_t) c.H * D, 3.0f), r = fvec((size_t) c.H * d_rel, 2.0f), sink = fvec((size_t) c.H, 3.0f),
+             proj = fvec((size_t) extent * d_rel);
+        uint8_t* dk = dev(kc);
+        uint8_t* dv = dev(vc);
+        float *dq = dev(q), *dr = dev(r), *ds = dev(sink), *dp = dev(proj);
+        float* scratch = dev_n<float>((size_t) c.H * (ctx + 128 * 130));
+        float* og = dev_n<float>((size_t) c.H * D);
+        float* os = dev_n<float>((size_t) c.H * D);
+        for (int mode = 0; mode < 2; ++mode) {
+            k::attn_gqa_mode(mode);
+            k::attn_decode_fp8(dq, dr, ds, dk, dv, c.kv_cap, c.H, c.KV, D, c.k0, c.nk, c.qpos, scale * k_inv, v_inv,
+                               dp, d_rel, extent, c.window, scratch, mode ? og : os, 0);
+        }
+        k::attn_gqa_mode(-1);
+        const auto got = host(og, (size_t) c.H * D);
+        const auto want = host(os, (size_t) c.H * D);
+        expect(c.name, got, std::vector<double>(want.begin(), want.end()), 1e-5, 2e-5);
+        if (c.H % c.KV || (c.H / c.KV != 3 && c.H / c.KV != 6)) {   // (no GQA kernel takes this shape: the two
+            size_t diff = 0;                                        //  modes are then the same kernel, to the bit)
+            for (size_t i = 0; i < got.size(); ++i) diff += got[i] != want[i];
+            expect_true("attn gqa / scalar: H16 KV4 bit-identical (no GQA path)", diff == 0);
+        }
+        for (float* p : {dq, dr, ds, dp, scratch, og, os})
+            cudaFree(p);
+        cudaFree(dk), cudaFree(dv);
+    }
+    {   // the FP16 cache rides the same kernel
+        const int H = 24, KV = 8, nk = 1200;
+        auto kf = fvec((size_t) nk * KV * D), vf = fvec((size_t) nk * KV * D);
+        std::vector<uint16_t> kh(kf.size()), vh(vf.size());
+        for (size_t i = 0; i < kf.size(); ++i) kh[i] = f2h_host(kf[i]), vh[i] = f2h_host(vf[i]);
+        auto q = fvec((size_t) H * D, 3.0f), r = fvec((size_t) H * d_rel, 2.0f), sink = fvec((size_t) H, 3.0f),
+             proj = fvec((size_t) extent * d_rel);
+        uint16_t* dk = dev(kh);
+        uint16_t* dv = dev(vh);
+        float *dq = dev(q), *dr = dev(r), *ds = dev(sink), *dp = dev(proj);
+        float* scratch = dev_n<float>((size_t) H * (ctx + 128 * 130));
+        float* og = dev_n<float>((size_t) H * D);
+        float* os = dev_n<float>((size_t) H * D);
+        for (int mode = 0; mode < 2; ++mode) {
+            k::attn_gqa_mode(mode);
+            k::attn_decode_f16(dq, dr, ds, dk, dv, 0, H, KV, D, 0, nk, nk - 1, scale, dp, d_rel, extent, 1 << 30,
+                               scratch, mode ? og : os, 0);
+        }
+        k::attn_gqa_mode(-1);
+        const auto got = host(og, (size_t) H * D);
+        const auto want = host(os, (size_t) H * D);
+        expect("attn gqa / scalar: H24 KV8 FP16 cache", got, std::vector<double>(want.begin(), want.end()), 1e-5,
+               2e-5);
+        for (float* p : {dq, dr, ds, dp, scratch, og, os})
+            cudaFree(p);
+        cudaFree(dk), cudaFree(dv);
+    }
+#else
+    std::printf("skipped on CUDA: test_attn_gqa (no GQA split kernel)\n");
+#endif
+}
+
 void test_round6() {
     // 1. attn_res_rms_f16: C=4608 (vectorized float4/576-thread) and odd C=517 (scalar fallback), with optional w / y32
     for (int C : {4608, 517}) {
@@ -2733,6 +2826,7 @@ int main() {
     test_experts_mma();
     test_q8_verify_tile();
 #endif
+    test_attn_gqa();   // (last: its random K / V leaves the others' data as it was)
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
