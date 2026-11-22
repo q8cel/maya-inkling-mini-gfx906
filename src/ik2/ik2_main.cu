@@ -3057,6 +3057,7 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
         }
     const int m = (int) next.size();   // (the anchor and next[0 .. m - 2] are kept: m positions)
     if (m < B) block_rollback(m);
+    use_dev(0);   // (the drafter, the taps and their buffers are GPU 0's: a forward may leave another device current)
     ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, m, P);
     ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, m - 1);
 }
@@ -5633,6 +5634,7 @@ int main(int argc, char** argv) {
                                 std::string(), lo, nullptr, t_exp);
                         if (last_c) last = std::move(lo);
                         if (drafter) {   // (the drafter's context for these positions, from their taps)
+                            use_dev(0);  // (its buffers are GPU 0's; forward() may leave another device current)
                             ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, (int) p0);
                             if (last_c) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
                         }
@@ -5819,6 +5821,7 @@ int main(int argc, char** argv) {
                     last = std::move(lo);
                 }
                 if (spec_on) {   // (the drafter's context for the token: its taps, row 0)
+                    use_dev(0);  // (the drafter's buffers are GPU 0's)
                     ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, 1, (int) hist.size());
                     ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, 0);
                     CU(cudaStreamSynchronize(g_s));
@@ -5878,6 +5881,7 @@ int main(int argc, char** argv) {
             if (all) logits.insert(logits.end(), lo.begin(), lo.end());
             else if (last && !ag.empty()) first_best = ag[0];
             if (drafter) {
+                use_dev(0);   // (the drafter's buffers are GPU 0's; forward() may leave another device current)
                 ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, p0);
                 if (last) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
             }
@@ -6007,6 +6011,7 @@ int main(int argc, char** argv) {
                 std::vector<float> lo;
                 std::vector<int> ag;
                 forward(M, &anchor, 1, P, false, OutMode::kArgmax, std::string(), lo, &ag, t_exp);
+                use_dev(0);   // (the drafter's buffers are GPU 0's)
                 ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, 1, P);
                 ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, 0);
                 CU(cudaStreamSynchronize(g_s));
@@ -6037,7 +6042,7 @@ int main(int argc, char** argv) {
         while ((int) out.size() < gen && P < ctx) {
             const int B = std::min(width, ctx - P);
             const double t0 = now();
-            use_dev(0);   // (the drafter's and the target's GPU 0 buffers: forward() leaves the current device there)
+            use_dev(0);   // (the drafter's and the target's GPU 0 buffers: propose launches on both)
             embed_row(M, anchor, raw, anchor_h);
             int dr[ik2::draft::kBlock - 1];
             if (B > 1) ik2::draft::propose(drafter, anchor, anchor_h, P, draft_head, c.n_rows, c.n_vocab, dr, B - 1);
@@ -6144,6 +6149,7 @@ int main(int argc, char** argv) {
                 if (use_block && n_steps >= block_check) block_rollback(n + 1);
                 else rollback(M, n + 1);
             }
+            use_dev(0);   // (the drafter's buffers are GPU 0's; forward() may leave another device current)
             ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n + 1, P);
             ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n);
             for (int j = 0; j < n && (int) out.size() < gen; ++j) out.push_back(dr[j]);

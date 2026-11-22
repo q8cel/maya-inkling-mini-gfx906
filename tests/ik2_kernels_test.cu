@@ -2275,6 +2275,223 @@ void test_attn_gqa() {
 #endif
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// the drafter's own ops (src/ik2/ik2_draft.cu's pipeline: mix_rms, draft_attn, rope_neox, rnn_inputs, rnn_gates,
+// to_bf16, silu_mul_bf16).  Nothing else calls them, so without these a port's bug in one of them shows up only as
+// the drafter's proposals going bad.
+uint16_t bf16_rn_host(float f) {   // f2bf_rn (ik2_kernels.cu), host side
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return 0x7fc0;
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (uint16_t) (u >> 16);
+}
+float bf16_host(uint16_t b) {
+    const uint32_t u = (uint32_t) b << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+void test_drafter_ops() {
+    // 1. to_bf16: the reference rounding's bits, over signs and exponents (the state, h and f_rnn all go through it)
+    {
+        const size_t n = 4099;
+        std::vector<float> x(n);
+        for (size_t i = 0; i < n; ++i) x[i] = std::ldexp(frand(2.0f), (int) (i % 41) - 20);
+        x[0] = 0.0f, x[1] = -0.0f, x[2] = 1.0f, x[3] = -1.0f, x[4] = 1e-30f, x[5] = 1e30f;
+        std::vector<uint16_t> want(n);
+        for (size_t i = 0; i < n; ++i) want[i] = bf16_rn_host(x[i]);
+        float* dx = dev(x);
+        uint16_t* dy = dev_n<uint16_t>(n);
+        k::to_bf16(dx, n, dy, 0);
+        expect_true("to_bf16 (bits)", host(dy, n) == want);
+        cudaFree(dx), cudaFree(dy);
+    }
+    // 2. mix_rms: the taps' softmax mix, one RMS a row, the dflare weight (write_context's and set_f_rnn's op).
+    //    rows=3 (a context chunk) and rows=1 (the f_rnn row), C=2304 as the model.
+    for (int rows : {3, 1}) {
+        const int n_tap = 4, C = 2304;
+        const size_t ld = 5;   // (a chunk's stride: the taps' rows are ld apart, not rows)
+        auto x = fvec((size_t) n_tap * ld * C, 1.0f);
+        std::vector<float> alpha = {-0.3f, 0.5f, 1.2f, 0.1f};   // (softmax'd at load; any weights here)
+        auto w = fvec(C, 1.0f);
+        for (auto& v : w) v = 1.0f + 0.1f * v;
+        const float eps = 1e-6f;
+        std::vector<double> want((size_t) rows * C);
+        for (int r = 0; r < rows; ++r) {
+            std::vector<double> m(C);
+            double a = 0.0;
+            for (int c = 0; c < C; ++c) {
+                double s = 0.0;
+                for (int t = 0; t < n_tap; ++t) s += (double) alpha[t] * x[(size_t) t * ld * C + (size_t) r * C + c];
+                m[c] = s, a += s * s;
+            }
+            const double inv = 1.0 / std::sqrt(a / C + eps);
+            for (int c = 0; c < C; ++c) want[(size_t) r * C + c] = m[c] * inv * w[c];
+        }
+        float *dx = dev(x), *da = dev(alpha), *dw = dev(w), *dy = dev_n<float>((size_t) rows * C);
+        k::mix_rms(dx, n_tap, ld * C, rows, C, da, dw, eps, dy, 0);
+        expect(rows == 3 ? "mix_rms (4 taps, 3 rows)" : "mix_rms (4 taps, 1 row)", host(dy, (size_t) rows * C), want,
+               1e-5, 1e-6);
+        cudaFree(dx), cudaFree(da), cudaFree(dw), cudaFree(dy);
+    }
+    // 3. rope_neox: the rotated halves (i with i + 64) at theta 1e6, the block's positions and a deep one
+    {
+        const int rows = 9, heads = 8, posv[9] = {0, 1, 2, 3, 512, 513, 1000, 1023, 65535};
+        const float theta = 1e6f;
+        auto x = fvec((size_t) rows * heads * 128, 1.0f);
+        auto x0 = x;
+        std::vector<int> pos(posv, posv + rows);
+        float* dx = dev(x);
+        int* dp = dev(pos);
+        k::rope_neox(dx, rows, heads, dp, theta, 0);
+        const auto got = host(dx, x.size());
+        std::vector<double> want(x.size());
+        for (int r = 0; r < rows; ++r)
+            for (int h = 0; h < heads; ++h)
+                for (int i = 0; i < 64; ++i) {
+                    const float inv = 1.0f / std::pow(theta, (float) (2 * i) / 128.0f);   // (as the kernel)
+                    const double ang = (double) ((float) posv[r] * inv), cs = std::cos(ang), sn = std::sin(ang);
+                    const size_t b = ((size_t) r * heads + h) * 128;
+                    const double a = x0[b + i], bb = x0[b + i + 64];
+                    want[b + i] = a * cs - bb * sn;
+                    want[b + i + 64] = bb * cs + a * sn;
+                }
+        // (a float angle at 65535 rad quantises to 2^-8: sin there is good to ~4e-3 against a double angle; a
+        //  wrong pairing, theta or stride is off by O(0.1))
+        expect("rope_neox (theta 1e6, 9 positions)", got, want, 1e-5, 5e-3);
+        cudaFree(dx), cudaFree(dp);
+    }
+    // 4. rnn_inputs: the 5120-wide Markov cell's input - state | bf16(w1[prev]) | h | f_rnn, bf16 each
+    {
+        const int R = 256, C = 2304, V = 64, prev = 37;
+        auto state = fvec(R, 1.0f), hidden = fvec(C, 1.0f), f = fvec(C, 1.0f);
+        std::vector<uint16_t> emb((size_t) V * R);
+        for (auto& v : emb) v = bf16_rn_host(frand(1.0f));
+        std::vector<uint16_t> want(2 * R + 2 * C);
+        for (int i = 0; i < R; ++i) want[i] = bf16_rn_host(state[i]);
+        for (int i = 0; i < R; ++i) want[R + i] = emb[(size_t) prev * R + i];
+        for (int i = 0; i < C; ++i) want[2 * R + i] = bf16_rn_host(hidden[i]);
+        for (int i = 0; i < C; ++i) want[2 * R + C + i] = bf16_rn_host(f[i]);
+        float *ds = dev(state), *dh = dev(hidden), *df = dev(f);
+        uint16_t* de = dev(emb);
+        int* dp = dev(std::vector<int>{prev});
+        uint16_t* dy = dev_n<uint16_t>(2 * R + 2 * C);
+        k::rnn_inputs(ds, de, dp, dh, df, R, C, dy, 0);
+        expect_true("rnn_inputs (state/emb/hidden/f, bf16)", host(dy, 2 * R + 2 * C) == want);
+        cudaFree(ds), cudaFree(dh), cudaFree(df), cudaFree(de), cudaFree(dp), cudaFree(dy);
+    }
+    // 5. rnn_gates: state = sigmoid(g_r) state + (1 - sigmoid(g_r)) tanh(c_r), latent = tanh(o_r) - the polarity
+    //    checked by a gate held at 0 with c_r at -5 (a state of 1 must become -1, not stay 1)
+    {
+        const int R = 256;
+        auto proj = fvec(3 * R, 1.0f), bias = fvec(3 * R, 0.5f);
+        auto state0 = fvec(R, 1.0f);
+        for (int i = 0; i < R; ++i) bias[i] = -20.0f, proj[R + i] = -5.0f, proj[i] = 0.0f;
+        std::vector<double> want_s(R), want_l(R);
+        for (int i = 0; i < R; ++i) {
+            const double gr = (double) proj[i] + bias[i], cr = (double) proj[R + i] + bias[R + i];
+            const double orw = (double) proj[2 * R + i] + bias[2 * R + i];
+            const double gate = 1.0 / (1.0 + std::exp(-gr));
+            want_s[i] = gate * state0[i] + (1.0 - gate) * std::tanh(cr);
+            want_l[i] = std::tanh(orw);
+        }
+        float *dp = dev(proj), *db = dev(bias), *ds = dev(state0), *dl = dev_n<float>(R);
+        k::rnn_gates(dp, db, R, ds, dl, 0);
+        expect("rnn_gates (state)", host(ds, R), want_s, 1e-6, 1e-6);
+        expect("rnn_gates (latent)", host(dl, R), want_l, 1e-6, 1e-6);
+        cudaFree(dp), cudaFree(db), cudaFree(ds), cudaFree(dl);
+    }
+    // 6. silu_mul_bf16: bf16(g / (1 + exp(-g)) * u), the MLP's half of layer_mlp
+    {
+        const int T = 3, F = 9216;   // (the mini's F; a prefix of it is enough)
+        auto gu = fvec((size_t) T * 2 * F, 6.0f);
+        std::vector<uint16_t> want((size_t) T * F);
+        for (int t = 0; t < T; ++t)
+            for (int f = 0; f < F; ++f) {
+                const double g = gu[(size_t) t * 2 * F + f], u = gu[(size_t) t * 2 * F + F + f];
+                want[(size_t) t * F + f] = bf16_rn_host((float) (g / (1.0 + std::exp(-g)) * u));
+            }
+        float* dg = dev(gu);
+        uint16_t* dy = dev_n<uint16_t>((size_t) T * F);
+        k::silu_mul_bf16(dg, T, F, dy, 0);
+        const auto raw = host(dy, (size_t) T * F);
+        std::vector<float> got(raw.size());
+        for (size_t i = 0; i < raw.size(); ++i) got[i] = bf16_host(raw[i]);
+        std::vector<double> wantf(want.size());
+        for (size_t i = 0; i < want.size(); ++i) wantf[i] = bf16_host(want[i]);
+        expect("silu_mul_bf16 (bf16)", got, wantf, 2e-2, 1e-6);   // (a ulp: the float product's rounding)
+        cudaFree(dg), cudaFree(dy);
+    }
+    // 7. draft_attn: the block's 8 queries against the context ring [k_lo, k_hi) plus the block's own keys, a head a
+    //    K / V head, the softmax normalised - F32 cache and FP16, an empty context, and a ring that wraps
+    for (int c16 : {0, 1}) {
+        struct Case {
+            int k_lo, k_hi, cap, nq;
+        };
+        const Case cases[] = {{0, 0, 2048, 8}, {447, 512, 2048, 8}, {1477, 2600, 1024, 8}, {0, 96, 2048, 1}};
+        static const char* names[2][4] = {{"f32 empty context", "f32 512 block", "f32 ring wraps", "f32 one query"},
+                                          {"f16 empty context", "f16 512 block", "f16 ring wraps", "f16 one query"}};
+        for (int ci = 0; ci < 4; ++ci) {
+            const Case& cs = cases[ci];
+            const int H = 24, Hkv = 8, D = 128, KD = Hkv * D;
+            const float scale = 1.0f / std::sqrt(128.0f);
+            const int nc = cs.k_hi - cs.k_lo, nq = cs.nq, nk = nc + nq;
+            auto q = fvec((size_t) nq * H * D, 1.0f);
+            auto kc = fvec((size_t) cs.cap * KD, 1.0f), vc = fvec((size_t) cs.cap * KD, 1.0f);
+            auto kb = fvec((size_t) nq * KD, 1.0f), vb = fvec((size_t) nq * KD, 1.0f);
+            std::vector<uint16_t> k16(kc.size()), v16(vc.size());
+            for (size_t i = 0; i < kc.size(); ++i) k16[i] = f2h_host(kc[i]), v16[i] = f2h_host(vc[i]);
+            if (c16)   // (the kernel reads the FP16 cache: the reference must too)
+                for (size_t i = 0; i < kc.size(); ++i) kc[i] = h2f_host(k16[i]), vc[i] = h2f_host(v16[i]);
+            std::vector<double> want((size_t) nq * H * D);
+            for (int qi = 0; qi < nq; ++qi)
+                for (int h = 0; h < H; ++h) {
+                    const int g = h / (H / Hkv);
+                    std::vector<double> lg(nk);
+                    double mx = -1e30;
+                    for (int j = 0; j < nk; ++j) {
+                        const float* kr = j < nc ? &kc[(size_t) ((cs.k_lo + j) % cs.cap) * KD + g * D]
+                                                 : &kb[(size_t) (j - nc) * KD + g * D];
+                        double s = 0.0;
+                        for (int d = 0; d < D; ++d) s += (double) q[((size_t) qi * H + h) * D + d] * kr[d];
+                        lg[j] = s * (double) scale, mx = std::max(mx, lg[j]);
+                    }
+                    double den = 0.0;
+                    for (int j = 0; j < nk; ++j) den += std::exp(lg[j] - mx);
+                    for (int d = 0; d < D; ++d) {
+                        double acc = 0.0;
+                        for (int j = 0; j < nk; ++j) {
+                            const float* vr = j < nc ? &vc[(size_t) ((cs.k_lo + j) % cs.cap) * KD + g * D]
+                                                     : &vb[(size_t) (j - nc) * KD + g * D];
+                            acc += std::exp(lg[j] - mx) / den * vr[d];
+                        }
+                        want[((size_t) qi * H + h) * D + d] = acc;
+                    }
+                }
+            const int S = std::max(1, std::min(64, (nk + 255) / 256)), per = (nk + S - 1) / S;
+            float* dsc = dev_n<float>((size_t) H * S * 8 * per + (size_t) S * H * 8 * 130);
+            float* dout = dev_n<float>((size_t) nq * H * D);
+            float* dq = dev(q);
+            float* dkb = dev(kb);
+            float* dvb = dev(vb);
+            float* dkf = dev(kc);
+            float* dvf = dev(vc);
+            uint16_t* dk16 = dev(k16);
+            uint16_t* dv16 = dev(v16);
+            if (c16)
+                k::draft_attn_f16(dq, dk16, dv16, cs.k_lo, cs.k_hi, dkb, dvb, nq, H, Hkv, scale, dsc, dout, 0,
+                                  cs.cap);
+            else
+                k::draft_attn(dq, dkf, dvf, cs.k_lo, cs.k_hi, dkb, dvb, nq, H, Hkv, scale, dsc, dout, 0, cs.cap);
+            expect(names[c16][ci], host(dout, (size_t) nq * H * D), want, c16 ? 2e-3 : 2e-4);
+            cudaFree(dsc), cudaFree(dout), cudaFree(dq), cudaFree(dkb), cudaFree(dvb), cudaFree(dkf), cudaFree(dvf),
+                cudaFree(dk16), cudaFree(dv16);
+        }
+    }
+}
+
 void test_round6() {
     // 1. attn_res_rms_f16: C=4608 (vectorized float4/576-thread) and odd C=517 (scalar fallback), with optional w / y32
     for (int C : {4608, 517}) {
@@ -2827,6 +3044,7 @@ int main() {
     test_q8_verify_tile();
 #endif
     test_attn_gqa();   // (last: its random K / V leaves the others' data as it was)
+    test_drafter_ops();
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
