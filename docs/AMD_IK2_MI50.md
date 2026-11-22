@@ -524,6 +524,28 @@ The audit did turn up two real faults in the configuration the fit check now ena
 
 With those two, the spec path runs in its intended configuration and the tests stay at 357 checks, 0 failures.
 
+### The window's determinism: measured, then fixed
+
+Plain decode was 5 of 5 identical (md5 `5608e98aa117`, 512-id README prompt, 64 tokens, 42.73 - 43.51 tok/s, FP16
+dense) on the final tip; **the window was 11 of 12** - the exception (`win1`, the first of twelve) diverged at
+generation token 52 (model position 563, 47528 where the other eleven pick 76), its accept counts differed at that
+window (4 accepted drafts against 5), and the top-2 margin at that position was **above** the 0.05 the near-tie
+print uses: not a tie flip, a different logits vector, roughly 1 in 12 windows. `IK2_EP_WIN=0` was 3 of 3 identical
+but runs at 21.0 - 21.4 tok/s (no workaround).
+
+The single-buffer packs, the lazy-copy classification (`sseq > g_seq_done`, the ring's aliasing sync) and the
+per-visit event chain were each re-read under this evidence and are conservative; what was not covered is the hit
+path's assumption itself: a *hit* takes its slot's bytes as final without any wait, and the copies that fill a slot
+do not all join the sseq protocol that the test reads (the window's own copies are inline `copy_in`s, and the
+prefill's prefetched ones are ordered by `pf_evs`, which only the prefill waits on). The fix is the conservative
+one: **every row of a window layer waits on the layer's copy-stream event before any expert kernel runs** - the
+hit / miss split is gone, and with it the assumption. Measured after (2026-11-22, 19:50 - 20:40, load ~2 - 3, 29 -
+33 C): **12 of 12 identical to plain** (`5608e98aa117` twelve times, 47.89 - 49.02 tok/s, mean 48.17, 3.00 tokens
+a window, verify 45.5 - 47.0 ms), 48.17 against 48.88 tok/s before (-1.5 %), `ik2_kernels_test` 357 checks, 0
+failures, plain unchanged (44.04 tok/s, `5608e98aa117`, same session, its path untouched) and the prefill 419 - 429
+tok/s (its path untouched). Twelve clean runs alone are not conclusive at a 1-in-12 rate (p ~ 0.35); the change is
+justified as well by being strictly conservative - it adds an ordering and removes none.
+
 ## Disabled on gfx906
 
 * **Tensor-core attention and experts** (`mma.sync m16n8k16`, Hopper `wgmma`, `cp.async`, `ldmatrix`,
@@ -562,29 +584,15 @@ warm; the per-GPU fill is 0.6 s; `READY` follows. Keep the GGUF page-cached for 
    call with an idle queue (11.7 µs pipelined), and the same ~10 µs gap sits around every small kernel. Capturing a
    *window* would take most of it, but the capture crosses two devices; per-layer, two-device graphs are the untested
    alternative.
-3. **The window's determinism** (observed once in twelve runs on the final tip - see the audit above): the window
-   path keeps one pinned 5 632-byte group table a
-   device and rewrites it every layer, while the copy that reads it is asynchronous. The ordering argument that makes
-   it safe is the per-layer routing round trip: layer *l*'s full-stream sync on GPU 0 comes after GPU 0's wait on
-   `done[l-1]` (recorded on GPU 1 after its pack copy), so the host cannot rewrite a pack before its previous reader
-   has finished; the same sync is what orders `Ed.get`'s evictions against the previous layer's kernels on both
-   devices. The events are per visit and only re-recorded in the next window (each window ends synchronised), and a
-   slot whose lazy copy may be in flight is classified with the misses and waited for. Any change that removes that
-   per-layer sync (the device-side routing this document asks for elsewhere) must give the packs a ring and wait on
-   the copy's own event. The one observed divergence was on a *folded-arithmetic* prototype binary during a
-   mid-script relink (3 of 4 identical). Measured on the final tip (2026-11-22, 18:00 - 19:00, load ~2 - 3, both
-   cards at 29 - 33 C): **plain decode 5 of 5 identical** (md5 `5608e98aa117`, 512-id README prompt, 64 tokens,
-   42.73 - 43.51 tok/s, FP16 dense); **the window 11 of 12 identical to plain** - the one that was not (`win1`, the
-   first of the twelve) diverged at generation token 52 (model position 563), picking 47528 where the other eleven
-   pick 76, and its accept counts differ at that window (4 accepted drafts against 5), **with the top-2 margin at
-   that position above the 0.05 the near-tie print uses** - i.e. it is not a tie flip but a different logits vector,
-   a structural nondeterminism at roughly 1 in 12 windows. `IK2_EP_WIN=0` (the window over one device's caches) was
-   3 of 3 identical, which narrows it to the EP-window block - the two-device peer copies and the slots owned by the
-   other device - but that path is 21.0 - 21.4 tok/s against plain 43.1, so it is no workaround. The single-buffer
-   packs, the lazy-copy classification (`sseq > g_seq_done`, and the ring's aliasing sync) and the per-visit event
-   chain were re-read under this evidence and are each conservative; the next experiment is to force every row into
-   the miss part (`late = true`), which waits on the copy event for hits too - if the flips stop, a hit reads a slot
-   whose bytes are not final and the fix is that wait, unconditionally. That is open work item 3.
+3. **The window's pack-ring constraint** (the determinism defect found here on 2026-11-22 is fixed - see the
+   window section): the window path keeps one pinned 5 632-byte group table a device and rewrites it every layer,
+   while the copy that reads it is asynchronous. The ordering argument that makes it safe is the per-layer routing
+   round trip: layer *l*'s full-stream sync on GPU 0 comes after GPU 0's wait on `done[l-1]` (recorded on GPU 1
+   after its pack copy), so the host cannot rewrite a pack before its previous reader has finished; the same sync is
+   what orders `Ed.get`'s evictions against the previous layer's kernels on both devices. The events are per visit
+   and only re-recorded in the next window (each window ends synchronised). Any change that removes that per-layer
+   sync (the device-side routing this document asks for elsewhere) must give the packs a ring and wait on the copy's
+   own event.
 4. **The limb kernels' epilogues and floor**: the fused gate / up SwiGLU epilogue is 21 % of a visit (0.025 ms) and
    MUFU-latency bound, and the limb kernels read at 294 GB/s against the memory's 890 (an 8-expert visit 0.1217 ms).
    The planar slot repack measured 0.84x (its own section), so what is left here is the epilogue and the read floor,

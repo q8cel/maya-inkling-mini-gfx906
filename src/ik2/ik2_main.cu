@@ -3529,44 +3529,46 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     CU(cudaStreamWaitEvent(g_s, g_win.x[vis], 0));
                     CU(cudaMemcpyPeerAsync(Wd.xq, 1, dev_work(0).xq, 0, TC * 4, g_s));
                 }
-                // this device's slots: its cache's slot each (a miss copied on the copy stream), hits first.  A slot
-                // whose lazy copy (a prefill's or an earlier layer's) may still be in flight goes with the misses:
-                // its bytes are waited for before any kernel of it runs, so a window is deterministic.
+                // this device's slots: its cache's slot each (a miss copied on the copy stream).  The rows are all
+                // one list and all wait on that stream below: a slot's bytes are only final once every copy into it
+                // is ordered, and the hit / miss split (which skipped the wait for hits) let one window in twelve
+                // read a slot that was not - see the comment on the wait.
                 lazy_poll();
+                // Every row waits on the copy stream's event below, hits included: a hit's slot bytes are only
+                // final if every copy into it is ordered before this layer's kernels, and the window's own copies
+                // and the prefill's prefetched ones are not in the sseq protocol the old hit / miss split tested
+                // (`sseq > g_seq_done`). The split measured 1 in 12 windows with a wrong logits vector; with the
+                // unconditional wait 12 of 12 repeat, at 48.2 against 48.9 tok/s (the overlap it gives up is small).
                 const uint8_t* where[64];
-                int hit[64], mis[64], nh = 0, nm = 0;
+                int mis[64], nm = 0, nreal = 0;
                 for (int i = 0; i < S; ++i) {
                     if (dev_of[i] != d) continue;
                     bool missed = false;
                     where[i] = Ed.get(Ly, l, top[i], tick, g_cs, &missed, true, false);
-                    const bool late = missed || Ed.slot_sseq(Ed.last_handle) > g_seq_done;
-                    (late ? mis[nm++] : hit[nh++]) = i;
+                    mis[nm++] = i;
+                    nreal += missed;
                 }
-                CU(cudaEventRecord(g_win.cp[d][vis], g_cs));   // (the misses' bytes: the hits' kernels go first)
+                CU(cudaEventRecord(g_win.cp[d][vis], g_cs));   // (this layer's copies: every kernel below waits on it)
                 uint8_t* pk = g_win.pack_h[d];
                 auto** gb = (const uint8_t**) pk;
                 int* gn = (int*) (pk + 512), *gtok = (int*) (pk + 768), *grow = (int*) (pk + 2816);
                 float* gsg = (float*) (pk + 4864), *gsu = (float*) (pk + 5120);
-                g_win.nmiss += nm;
-                int gexp[64], n_part[2] = {0, 0}, g0 = 0;
-                for (int part = 0; part < 2; ++part) {
-                    const int n = part ? nm : nh;
-                    for (int j = 0; j < n; ++j) {
-                        const int i = (part ? mis : hit)[j], e = top[i];
-                        int g = -1;
-                        for (int u = g0; u < g0 + n_part[part]; ++u)
-                            if (gexp[u] == e) { g = u; break; }
-                        if (g < 0) {
-                            g = g0 + n_part[part]++;
-                            gexp[g] = e, gb[g] = where[i], gn[g] = 0;
-                        }
-                        const int m = gn[g]++;
-                        gtok[g * k::kGroupMax + m] = i / c.K;
-                        grow[g * k::kGroupMax + m] = i;
-                        gsg[i] = Ly.scale[0].empty() ? 1.0f : Ly.scale[0][e];
-                        gsu[i] = Ly.scale[1].empty() ? 1.0f : Ly.scale[1][e];
+                g_win.nmiss += nreal;
+                int gexp[64], g0 = 0;
+                for (int j = 0; j < nm; ++j) {
+                    const int i = mis[j], e = top[i];
+                    int g = -1;
+                    for (int u = 0; u < g0; ++u)
+                        if (gexp[u] == e) { g = u; break; }
+                    if (g < 0) {
+                        g = g0++;
+                        gexp[g] = e, gb[g] = where[i], gn[g] = 0;
                     }
-                    g0 += n_part[part];
+                    const int m = gn[g]++;
+                    gtok[g * k::kGroupMax + m] = i / c.K;
+                    grow[g * k::kGroupMax + m] = i;
+                    gsg[i] = Ly.scale[0].empty() ? 1.0f : Ly.scale[0][e];
+                    gsu[i] = Ly.scale[1].empty() ? 1.0f : Ly.scale[1][e];
                 }
                 g_win.ngroups += g0;
                 CU(cudaMemcpyAsync(g_win.pack_d[d], pk, 5632, cudaMemcpyHostToDevice, g_s));
@@ -3576,19 +3578,12 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 const int* pgr = (const int*) (g_win.pack_d[d] + 2816);
                 const float* psg = (const float*) (g_win.pack_d[d] + 4864);
                 const float* psu = (const float*) (g_win.pack_d[d] + 5120);
-                int gp = 0;
-                const int n_parts = n_part[1] ? 2 : 1;   // (a window whose misses are all in: the hits' part alone)
-                for (int part = 0; part < n_parts; ++part) {
-                    const int gc = n_part[part];
-                    if (!gc) continue;
-                    if (part) CU(cudaStreamWaitEvent(g_s, g_win.cp[d][vis], 0));
-                    const int go = gp;
-                    gp += gc;
-                    k::expert_limb_gate_g(pgb + go, pgn + go, pgt + (size_t) go * k::kGroupMax, pgr + (size_t) go * k::kGroupMax,
-                                          gc, Ly.eb[0], C, F, Wd.xq, T, psg, psu, c.gate_cap, c.up_cap, Wd.h16,
-                                          Wd.gu32, g_s, q8_limb);
-                    k::expert_limb_down_g(pgb + go, pgn + go, pgr + (size_t) go * k::kGroupMax, gc, S, Ly.eb[0] + Ly.eb[1],
-                                          C, F, Wd.h16, Wd.y32, Wd.gu32, g_s, q8_limb);
+                CU(cudaStreamWaitEvent(g_s, g_win.cp[d][vis], 0));
+                if (g0) {
+                    k::expert_limb_gate_g(pgb, pgn, pgt, pgr, g0, Ly.eb[0], C, F, Wd.xq, T, psg, psu, c.gate_cap,
+                                          c.up_cap, Wd.h16, Wd.gu32, g_s, q8_limb);
+                    k::expert_limb_down_g(pgb, pgn, pgr, g0, S, Ly.eb[0] + Ly.eb[1], C, F, Wd.h16, Wd.y32, Wd.gu32,
+                                          g_s, q8_limb);
                 }
                 if (d == 1) {
                     CU(cudaMemcpyPeerAsync(dev_work(0).y32 + (size_t) 64 * C, 0, Wd.y32, 1, (size_t) S * C * 4, g_s));
