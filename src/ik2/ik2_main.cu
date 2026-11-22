@@ -6212,6 +6212,7 @@ int main(int argc, char** argv) {
                     embed_row(M, tok, sraw, sanchor);
                     int dr[ik2::draft::kBlock - 1];
                     ik2::draft::propose(drafter, tok, sanchor, P0, draft_head, c.n_rows, c.n_vocab, dr, B - 1);
+                    const double t1 = now();
                     int tk[ik2::draft::kBlock];
                     tk[0] = tok;
                     for (int j = 1; j < B; ++j) tk[j] = dr[j - 1];
@@ -6224,6 +6225,7 @@ int main(int argc, char** argv) {
                             t_exp);
                     g_rec = false;
                     CU(cudaStreamSynchronize(g_s));
+                    const double t_fwd0 = now();
                     int xs[ik2::draft::kBlock];
                     if (want_logits) {
                         for (int j = 0; j < B; ++j) xs[j] = pick(lo.data() + (size_t) j * c.n_vocab);
@@ -6239,6 +6241,20 @@ int main(int argc, char** argv) {
                             break;
                         }
                     const int kept = stop_at >= 0 ? stop_at : n;   // (the drafts that stay in the cache)
+                    if (getenv("IK2_SERVE_PROF")) {   // (temporary: a window's sections, and the first proposals)
+                        static int dumps = 0;
+                        const double t_prop = t1 - ts, t_fwd = t_fwd0 - t1, t_rest = now() - t_fwd0;
+                        std::fprintf(stderr, "win %d at %d: B %d kept %d | propose %.1f fwd %.1f rest %.1f ms\n",
+                                     dumps, P0, B, n, t_prop * 1e3, t_fwd * 1e3, t_rest * 1e3);
+                        if (dumps < 3) {
+                            std::fprintf(stderr, "  drafts");
+                            for (int j = 0; j < B - 1; ++j) std::fprintf(stderr, " %d", dr[j]);
+                            std::fprintf(stderr, " | target");
+                            for (int j = 0; j < B; ++j) std::fprintf(stderr, " %d", xs[j]);
+                            std::fprintf(stderr, "\n");
+                        }
+                        ++dumps;
+                    }
                     if (kept + 1 < B) rollback(M, kept + 1);
                     use_dev(0);
                     ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, kept + 1, P0);

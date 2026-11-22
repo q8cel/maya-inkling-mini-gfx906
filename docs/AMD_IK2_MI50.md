@@ -572,10 +572,16 @@ answers, `IK2_DRAFT_CTX=65536`, EP, FP8 KV, 262144 context):
 | q8 | window, adaptive | 30.9 | 11 windows (9 of 22 drafts), 43 plain |
 
 A window's step costs ~+20 ms (FP16) or ~+60 ms (q8) more than a plain token in the serve path, so even a 38 %
-acceptance cannot pay it; the controller backs off to plain but the probes still cost ~25 %.  The CLI's window at
-131072 context is the paying path (48.0 against 43.1 tok/s); why the same width costs more per step in serve is open
-(the serve loop's `place_decode` and the deeper cache are the suspects), and until it is understood the window stays
-behind `IK2_SERVE_DRAFT=1` rather than regressing `--serve --draft` by ~20 %.  Streaming, cancellation and SIGTERM
+acceptance cannot pay it; the controller backs off to plain but the probes still cost ~25 %.
+
+**The serve loop is not the overhead.** `IK2_SERVE_PROF=1` times a step's sections (propose 15.3 ms, the window's
+`forward` 52 - 96 ms, sampling / rollback / emit under 0.1 ms), and the *CLI* at the same settings is identical:
+`--max-context 262144`, FP16, width 5, 255-token prompt -> `drafting 15.3 ms, verifying 57.0 ms`, 2.25 tokens a step,
+**31.1 tok/s** against the serve path's 31.7.  What the window pays for is the **expert cache at 262144**: the same
+63-token generation misses **901** experts there against **90** at 131072 (the window's union is ~40 experts a layer
+against the plain path's 8), i.e. ~1 GiB of expert copies, ~0.25 s of the 2.0 s.  So the window pays where the union
+is resident - 131072: 48.0 against 43.1 tok/s, 3.0 tokens a step - and cannot at 262144 with the current
+`--cache-gb 14` (K/V 4.2 GiB leaves too little for the union), which is why it stays behind `IK2_SERVE_DRAFT=1`.  Streaming, cancellation and SIGTERM
 were re-checked with it on: one delta a token, a client disconnect ends the request (`cancel=True`), and the engine
 exits in ~1 s.
 
