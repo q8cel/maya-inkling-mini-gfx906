@@ -52,8 +52,11 @@ experts + 3.4 GiB dense + 2.2 GiB KV + work ≈ 14.4 of 15.8 GiB free, GPU 1 7.4
 
 ## Measured (2 × MI50, 16 GiB each)
 
-Final state of the branch (`IK2_EP=1`, FP8 KV, `IK2_DRAFT_ADAPT=0`, a shared box with load ~2 - 7: the plain rows
-were taken with the planar Q8 dense the fit check enables, the spec rows with the FP16 dense a drafter selects):
+Final state of the branch (`IK2_EP=1`, FP8 KV, `IK2_DRAFT_ADAPT=0`, a shared box with load ~2 - 7). The dense mode
+a row was taken with matters and is named: **the plain rows are the fit check's planar Q8** (what it selects on a free
+card when `IK2_DENSE` is unset and no drafter is loaded; the same runs on FP16 dense are 43.3 - 44.2 tok/s at 255, and
+`IK2_DENSE=f16` forces that), **the spec rows are FP16 dense** (a loaded drafter sets it; `IK2_DENSE=q8` overrides
+either way and costs the window ~20 ms a step):
 
 | | llama.cpp (baseline) | maya-ik2, HIP |
 |---|---|---|
@@ -63,14 +66,18 @@ were taken with the planar Q8 dense the fit check enables, the spec rows with th
 | `--draft`, 512-id README, width 5, `IK2_DRAFT_ADAPT=0` | | **48.1 tok/s**, 2.95 tokens a window, 15.6 + 45.7 ms (1.10x the 43 - 44 plain) |
 | `ik2_kernels_test` | | **357 checks, 0 failures** |
 
-The 32K decode figure is the final build's (`attn_split_gqa_kernel`, below). The same binary measured 33.4 tok/s
-(30.0 ms/token) on a cool machine: a sustained hour of load costs ~20 % of this kernel's throughput (the
-context-independent sections drift ~4 % in the same window), so treat 32.2-33.4 tok/s as the spread.
+The 32K decode figure is the final build's (`attn_split_gqa_kernel`, below) and is paired: 35.05 and 35.08 tok/s
+(28.5 ms/token), two runs back to back on the shared box (load ~2, 24 - 29 C, sclk 1801 MHz, mclk 1000). On an idle
+box with the GGUF page-cached the same binary has measured 34.4 - 34.6; a sustained hour of load costs ~20 % of this
+kernel's throughput (the context-independent sections drift ~4 % in the same window), so the 32K range to trust is
+**34.4 - 35.1 tok/s**, 35.05/35.08 being the final paired figure. The older 32.2 - 33.4 spread was the
+pre-GQA-split-and-merge build and is not this one.
 
 ### After the upstream sync (`e819852`)
 
 The merge re-applied the HIP guards on upstream's new code; all three targets build for gfx906 and
-`ik2_kernels_test` is **344 checks, 0 failures**. The 345-check log quoted during the sync was not the committed
+`ik2_kernels_test` is **344 checks, 0 failures** at that commit (the tip is **357** after the two-level attention
+tests, five of which `test_attn_two_level` adds). The 345-check log quoted during the sync was not the committed
 tip: it included an uncommitted `attn window queries / per-query: H24 KV8 8 queries 5000 keys` check (a window
 experiment; `/tmp/kt_new.log`). A clean build of `c11d62e` runs 344 `ok` checks with exactly this tree's list, so
 no check was lost in the merge. Newly disabled by HIP: upstream's single-token EP expert fast path
