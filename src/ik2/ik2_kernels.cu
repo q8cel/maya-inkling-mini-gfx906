@@ -3859,6 +3859,8 @@ __global__ void attn_split_gqa_kernel(const float* q, const float* r, const KV* 
 }
 #pragma clang fp contract(off)
 
+#pragma clang fp contract(off)
+
 template <class KV, int G>
 void attn_split_gqa_go(const float* q, const float* r, const KV* kc, const KV* vc, int kv_cap, int nq, int H,
                        int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj, int d_rel, int extent,
@@ -6049,30 +6051,37 @@ void expert_limb_mv(bool gate, const uint8_t* const* blob, size_t offset, int C,
 }
 // A window's experts by group (nv_limb_mv_g): gate | up of every row from one pack of the T tokens' x (F32), then
 // down from one pack of the S slots' h (F16).  G = the slots (S): groups past the last have n = 0 and return.
+// (8 warps a block, a row a warp: a group's members' packed inputs are then read once for eight rows; 4, 8 and 16
+// warps a block measured the same on the window, so the block stays the size the limb kernels' tests cover.)
+constexpr int kExpWarps = 8;
 void expert_limb_gate_g(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, size_t off_up,
                         int C, int F, const float* x, int T, const float* sg, const float* su, float gcap, float ucap,
                         uint16_t* h, void* scratch, cudaStream_t s, bool q8) {
     auto* p = (NvInput*) scratch;
     nv_input<true><<<dim3((C / 16 + 31) / 32, T), 32, 0, s>>>(x, nullptr, C, p, q8);
-    // (8 warps a block: the members' packed inputs are read once for eight rows of the expert, not four)
-    const dim3 gr((unsigned) ((F + 7) / 8), (unsigned) G);
+    // (kExpWarps warps a block: the members' packed inputs are read once for that many rows of the expert)
+    const int W_ = kExpWarps;
+    const dim3 gr((unsigned) ((F + W_ - 1) / W_), (unsigned) G);
+    const unsigned nb = (unsigned) (W_ * 32);
     if (q8)
-        nv_limb_mv_g<true, true><<<gr, 256, 0, s>>>(blob, n, tok, row, p, off_up, C, F, sg, su, gcap, ucap, h, nullptr);
+        nv_limb_mv_g<true, true><<<gr, nb, 0, s>>>(blob, n, tok, row, p, off_up, C, F, sg, su, gcap, ucap, h, nullptr);
     else
-        nv_limb_mv_g<true, false><<<gr, 256, 0, s>>>(blob, n, tok, row, p, off_up, C, F, sg, su, gcap, ucap, h, nullptr);
+        nv_limb_mv_g<true, false><<<gr, nb, 0, s>>>(blob, n, tok, row, p, off_up, C, F, sg, su, gcap, ucap, h, nullptr);
     check("expert_limb_gate_g");
 }
 void expert_limb_down_g(const uint8_t* const* blob, const int* n, const int* row, int G, int S, size_t off_down, int C,
                         int F, const uint16_t* h, float* y, void* scratch, cudaStream_t s, bool q8) {
     auto* p = (NvInput*) scratch;
     nv_input<false><<<dim3((F / 16 + 31) / 32, S), 32, 0, s>>>(nullptr, h, F, p, q8);
-    const dim3 gr((unsigned) ((C + 15) / 16), (unsigned) G);
+    const int W_ = kExpWarps;
+    const dim3 gr((unsigned) ((C + 2 * W_ - 1) / (2 * W_)), (unsigned) G);
+    const unsigned nb = (unsigned) (W_ * 32);
     if (q8)
-        nv_limb_mv_g<false, true><<<gr, 256, 0, s>>>(blob, n, nullptr, row, p, off_down, C, F, nullptr, nullptr, 0, 0,
-                                                     nullptr, y);
+        nv_limb_mv_g<false, true><<<gr, nb, 0, s>>>(blob, n, nullptr, row, p, off_down, C, F, nullptr, nullptr, 0, 0,
+                                                    nullptr, y);
     else
-        nv_limb_mv_g<false, false><<<gr, 256, 0, s>>>(blob, n, nullptr, row, p, off_down, C, F, nullptr, nullptr, 0, 0,
-                                                      nullptr, y);
+        nv_limb_mv_g<false, false><<<gr, nb, 0, s>>>(blob, n, nullptr, row, p, off_down, C, F, nullptr, nullptr, 0, 0,
+                                                     nullptr, y);
     check("expert_limb_down_g");
 }
 __global__ void ep_pick_table_kernel(const int* top, const float* w, const uint8_t* own, int l, int E, int S, int d,

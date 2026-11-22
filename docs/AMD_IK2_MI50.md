@@ -139,10 +139,23 @@ The window now takes four other paths. They are additive: `T == 1`, the prefill 
   shared by them; hipBLAS' GEMM read the same weights at 45 GB/s at 2 .. 8 rows (37 ms of a window's projections
   against 4.3 ms of dense work a token), this at 195. The 8-value order is `mv_f16_token`'s, so a row's sum is
   bit-identical to one token's GEMV.
-* **Nothing else pays yet.** The attention kernel stays per query: NQ of a window's queries a block (the K / V rows
-  read once for them) measured *slower* (4 queries a block: 88.6 ms a window against 55.2, register pressure and the
-  per-query softmax), and was dropped. The per-layer routing round trip stays: the expert caches are host-side, so the
-  picks must come to the host.
+* **The attention kernel stays per query.** Three blocked designs (one K / V read for the window's queries) were built
+  and measured against it, and all lost - at 255 tokens where the read is small and at 32768 where it dominates:
+
+  | design | 255, width 8 | 32768, width 5 |
+  |---|---|---|
+  | a block a query, four warps splitting its keys (the kernel above) | 55.2 - 58.9 ms a window | **78.1** |
+  | the window's queries a warp each, one key stream a warp (256 threads) | 88.6 | 86.0 |
+  | a warp a query over the same keys, a block 4 queries x 4 warps a query | - | 92.5 |
+
+  What limits it is not the K / V bytes but the online softmax: each key's update is a chain on (m, s, o), so a warp
+  with `nk / P` keys of it serialises, and the per-query kernel's four-way split of one query's keys is what hides the
+  load latency. Sharing a row across queries costs shared memory (24.5 KiB a block for four queries) and occupancy, or
+  - held in registers - 2 to 4 queries a warp, which measured slower still (`q4`/`ow` per query: 88.6 ms at 255 for
+  4, 76.3 for 2). The 32768-token window is therefore still 78 ms of verify; a tensor-core block attention (the CUDA
+  path's `attn_block_mma`, compiled out here) or shorter chains (a two-level softmax that keeps four keys in flight)
+  is what that needs.
+* **The per-layer routing round trip stays**: the expert caches are host-side, so the picks must come to the host.
 
 `IK2_EP_WIN=0` restores the previous window (the scalar row kernels, GPU 0's cache), `IK2_GEMV_WIN=0` the hipBLAS dense
 products. Measured with `IK2_DRAFT_ADAPT=0` (every step a window), 63 tokens after the prompt, two cards, FP8 KV:
@@ -157,6 +170,12 @@ products. Measured with `IK2_DRAFT_ADAPT=0` (every step a window), 63 tokens aft
 | 511 ids, README | 8 | 3.32 | 44 of 133 (33 %) | 17.2 + 58.6 ms | 43.8 (42.7) |
 | 511 ids, README | 5 | 3.00 | 42 of 84 (50 %) | 15.6 + 45.8 ms | **48.8 (42.7)** |
 | 32768 ids | 5 | 2.21 | 24 of 56 (43 %) | 20.9 + 78.0 ms | 22.4 (34.6) |
+
+A later session with the same binary measured every window configuration 1.4 - 1.5x slower than the table above
+(README width 5: 67 ms a window, 36.1 tok/s against plain 42.7) while plain decode (43.9) and the prefill (437 tok/s)
+were unchanged; the window's dense products and head are what moved (a width-8 window's projections 9.7 -> 13.4 ms,
+head 3.4 -> 4.8), the expert block did not (22.0 -> 22.9). Until that is explained, read the spec/plain ratio as
++-25% between sessions; the same build also repeated a window's stream only 2 runs in 3 (see below).
 
 The stream is the target's: the same 63 ids as plain decode on all three prompts except near ties (at 255: 159542 /
 152804 tie at 27.0161 / 27.0121; on the README prompt 197020 / 196978 early in the run - a window's summation order
@@ -177,6 +196,13 @@ A width-8 window at 255 tokens, section by section (`IK2_WINPROF=1`, 8 windows, 
 | head (8 rows x 200058) | 3.4 | |
 | convs + residual | 1.2 | |
 | total | 57.9 | (56.7 ms a window measured without the profiler) |
+
+**Determinism of a window.** Two races in the two-device window path were found and fixed: a slot whose lazy copy
+(a prompt's or an earlier layer's) was still in flight went with the *hits*, whose kernels do not wait for the copy
+stream (it now goes with the misses, as the token path's `slot_sseq` check does), and `g_ep_x / cp / done` were
+re-recorded every layer while the other device's wait on them might still be queued (each visit now has its own
+events, created on the device whose stream records them). Three repeat runs of the README prompt at width 5 then gave
+two identical streams and one that flipped a near tie early - not yet fully deterministic, and the open item below.
 
 What is left in the window, in the order the profile puts it: the experts' 297 GB/s is one device's rate (each of the
 two devices reads ~3.2 GB in the 22 ms, i.e. 147 GB/s against `nv_limb_mv`'s 294 - the grouped kernel's extra dots are
@@ -234,7 +260,9 @@ warm; the per-GPU fill is 0.6 s; `READY` follows. Keep the GGUF page-cached for 
    or `exp2f` (2 instructions) if a last-bit change is acceptable.
 4. Planar Q8 dense (`IK2_DENSE=q8`) works with EP and halves the dense bytes a token reads (42.9 → 43.2
    tok/s) but a prefill chunk then dequantizes every projection per pass (421 → 209 tok/s): opt-in only.
-5. The drafter's verify window (after the work above: 58 ms at width 8, 255 tokens, against 286 before it): the
+5. The drafter's verify window. It is **not yet deterministic** run to run (2 of 3 repeats): the two-device expert
+   path needs an audit for a remaining copy/eviction race (the token path's `slot_sseq` check and per-visit events are
+   in; a slot evicted by a later layer while an earlier layer's kernel still reads it is the next suspect). Then: the
    experts' 297 GB/s over the two devices is one device's rate (147 GB/s a device against `nv_limb_mv`'s 294), the
    window's dense GEMV reads 195 GB/s against `mv_f16_token`'s 840 (a shared-memory tile of `x` and a warp 4 rows of
    the matrix both measured slower and were dropped), and the routing's 48 D2H syncs (4 ms) need device-side expert
