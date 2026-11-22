@@ -356,6 +356,53 @@ only shifts logits by ~1e-5, so what it did was *expose* the residual copy race 
 evicted by a later layer while an earlier layer's kernel still reads it) - the item is still open, and the committed
 arithmetic is the one that repeats.
 
+### The load shape, not the arithmetic: a prefetch that loses and the budget for 8 lanes
+
+The committed kernel's own numbers first: `llvm-readelf -n` on the device object
+(`build-hip-gfx906/CMakeFiles/ik2_kernels.dir/src/ik2/ik2_kernels.cu.o.0.hipv4-amdgcn-amd-amdhsa--gfx906`) reports
+**64 VGPRs, 2 VGPR spills, 48 SGPRs** for the FP8 GQA kernel the plain decode and the window both run. That is the
+register budget every change here has to live in - and why KF = 4 (four keys a warp) at ~95 - 105 spilled and lost 32 %.
+
+**A two-deep prefetch of the K row** was the next try, since the dot waits on that 4-byte lane load of an FP8 row: the
+next key's row issued at the top of the body (addresses frozen - a ring slot's successor, or a linear cache's next
+position clamped to the last key - so the extra load is always a valid row), the body reading the one in flight. It is
+bit-identical (`test_attn_gqa` unchanged at 0.06 of its tolerance, 357 checks green) and it is **slower**:
+
+| 32768 ids, plain decode, `IK2_PROF2` over 31 tokens | attention kernel |
+|---|---|
+| committed kernel | **7.46 / 7.47 ms a token** |
+| two-deep K prefetch | **7.63** (+2.3 %) |
+| committed kernel again (after reverting) | **7.46** ms, 31.85 tok/s |
+
+So the two loads a key (K and V) were already in flight before the dot consumed K - the compiler had the loop pipelined
+inside 64 VGPRs - and the prefetch only added one redundant clamped load a warp and disturbed the schedule. A V
+prefetch would add more of the same. The measurement is a clean negative and the kernel is unchanged.
+
+What the kernel *is* bound by is the shape of its reads. Per key a block reads 384 B (the three query heads' slices of
+one K head, contiguous) out of a 1 024 B KV row that the other seven K heads' blocks read separately, i.e. a 1 KiB
+stride with 37.5 % of each row used by any one block. The numbers agree:
+
+| | K / V bytes | attention kernel | effective |
+|---|---|---|---|
+| plain decode, 32768 | 1.02 GB a token (15 non-sliding visits x 8 K heads x 32768 keys x 256 B + the sliding layers) | 7.46 ms | **137 GB/s** |
+| window, 32768, width 5 | 5.1 GB a window (the same x 5 queries) | 20.9 ms | **244 GB/s** |
+
+Against the memory's 890 GB/s that is 15 % / 27 %; against the ~334 GB/s the 384-B-of-1-KiB pattern can reach it is
+41 % / 73 %. The window's better figure is the GQA sharing already working (three heads a row read); the rest is the
+stride. Nothing in the instruction stream moves it, which is consistent with the 4.4 % ceiling the exps measured.
+
+**The 8-lane x 4-key mapping** (each 8-lane group owning one key, 16 B a lane of K and V, a 3-step group butterfly)
+was specified and *not* built, because its budget does not fit: 8 lanes a key means a lane holds 16 dimensions of the
+row, so `q` becomes 16 floats a head (48 for G = 3), the output accumulator `ow` 16 floats a head (48), plus the K and
+V rows (16 + 16) and the running `(m, s)` - about **130 VGPRs** against the 64 the kernel has and the ~95 - 105 that
+already spilled. The escape (one head a pass, so `q`/`ow` are 16 each) re-reads the K / V rows three times, which is
+exactly the sharing that measured slower (86.0 / 92.5 ms). The other escape is a heads-major KV cache, so one block's
+read is a whole 1 KiB row - a change to the cache format, the prefill and the scalar path, not to this kernel.
+
+On the acceptance for this attempt: 32K attention <= 6 ms a token is **not** met (7.46), the window is 64.1 ms against
+58, and the plain stream is 31.85 tok/s on a shared box (34.4 - 34.6 idle). The prefetch and the mapping are recorded
+here as measured negatives; the committed kernel is what runs.
+
 ## Disabled on gfx906
 
 * **Tensor-core attention and experts** (`mma.sync m16n8k16`, Hopper `wgmma`, `cp.async`, `ldmatrix`,
@@ -407,9 +454,11 @@ warm; the per-GPU fill is 0.6 s; `READY` follows. Keep the GGUF page-cached for 
    reproduce on that prompt after the sync (366.9 against 362.4 tok/s plain), so treat `421 → 209` as
    chunk/context-dependent and measure before enabling: opt-in only.
 5. The drafter's verify window: deterministic at 255 (5 of 5 repeats, above) after the copy-stream and event fixes,
-   but one README repeat in three still flipped a near tie where the box was busy - the next suspect is a host-side
-   pack buffer reused before the GPU consumed it (the window's pack ring is four deep, one a device a layer) rather
-   than the expert path. Then: the
+   but not complete: on a folded-arithmetic binary the same 255 runs gave four different streams in five where the
+   committed arithmetic gives five identical, and on a busy box one README repeat in three still flipped a near tie.
+   The next suspects are a host-side pack buffer reused before the GPU consumed it (the window's pack ring is four
+   deep, one a device a layer) and a slot evicted by a later layer while an earlier layer's kernel still reads it -
+   the expert path itself is not one. Then: the
    experts' 297 GB/s over the two devices is one device's rate (147 GB/s a device against `nv_limb_mv`'s 294), the
    window's dense GEMV reads 195 GB/s against `mv_f16_token`'s 840 (a shared-memory tile of `x` and a warp 4 rows of
    the matrix both measured slower and were dropped), and the routing's 48 D2H syncs (4 ms) need device-side expert
