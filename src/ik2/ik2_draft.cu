@@ -532,6 +532,34 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
 }
 
 size_t bytes(const Drafter* d) { return d->vram; }
+
+// A conversation parked in host RAM (the serve loop's IK2_SLOT_KEEP): each layer's context cache, slots 0 .. min(P, cap)
+// - 1 (the positions themselves before a ring wraps, the whole ring after), K then V, and f_rnn last.
+size_t context_bytes(const Drafter* d, int P) {
+    const size_t KD = (size_t) d->KV * 128;
+    size_t b = (size_t) d->C * 4;
+    for (const auto& l : d->L) b += 2 * (size_t) std::min(P, l.cap) * KD * (l.kc16 ? 2 : 4);
+    return b;
+}
+static void copy_context(Drafter* d, int P, uint8_t* host, bool save) {
+    const size_t KD = (size_t) d->KV * 128;
+    cu(cudaStreamSynchronize(d->s), "drafter park");
+    size_t at = 0;
+    auto one = [&](void* dev, size_t n) {
+        cu(save ? cudaMemcpy(host + at, dev, n, cudaMemcpyDefault) : cudaMemcpy(dev, host + at, n, cudaMemcpyDefault),
+           "drafter park");
+        at += n;
+    };
+    for (auto& l : d->L) {
+        const size_t n = (size_t) std::min(P, l.cap) * KD * (l.kc16 ? 2 : 4);
+        one(l.kc16 ? (void*) l.kc16 : (void*) l.kc, n);
+        one(l.kc16 ? (void*) l.vc16 : (void*) l.vc, n);
+    }
+    one(d->f_rnn, (size_t) d->C * 4);
+}
+void save_context(Drafter* d, int P, uint8_t* out) { copy_context(d, P, out, true); }
+void load_context(Drafter* d, int P, const uint8_t* in) { copy_context(d, P, const_cast<uint8_t*>(in), false); }
+
 void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d) { d->head_q8 = q8, d->head_q8d = q8d; }
 
 }  // namespace ik2::draft

@@ -163,4 +163,26 @@ inline hipError_t cudaGraphInstantiate(hipGraphExec_t* exec, hipGraph_t graph,
 #define cudaMemcpyToSymbol(symbol, ...) hipMemcpyToSymbol(HIP_SYMBOL(symbol), __VA_ARGS__)
 #define cudaMemcpyFromSymbol(dst, symbol, ...) hipMemcpyFromSymbol(dst, HIP_SYMBOL(symbol), __VA_ARGS__)
 
+// managed memory: ik2's tiered expert cache (cudaMallocManaged + advise/prefetch)
+#define cudaMallocManaged hipMallocManaged
+#define cudaMemPrefetchAsync hipMemPrefetchAsync
+#define cudaMemAdvise hipMemAdvise
+#define cudaCpuDeviceId hipCpuDeviceId
+#define cudaDevAttrConcurrentManagedAccess hipDeviceAttributeConcurrentManagedAccess
+#define cudaMemAdviseSetReadMostly hipMemAdviseSetReadMostly
+#define cudaMemAdviseUnsetReadMostly hipMemAdviseUnsetReadMostly
+#define cudaMemAdviseSetPreferredLocation hipMemAdviseSetPreferredLocation
+#define cudaMemAdviseUnsetPreferredLocation hipMemAdviseUnsetPreferredLocation
+#define cudaMemAdviseSetAccessedBy hipMemAdviseSetAccessedBy
+#define cudaMemAdviseUnsetAccessedBy hipMemAdviseUnsetAccessedBy
+#define cudaMemoryAdvise hipMemoryAdvise
+#define cudaMemLocation hipMemLocation
+#define cudaMemLocationTypeHost hipMemLocationTypeHost
+#define cudaMemLocationTypeDevice hipMemLocationTypeDevice
+
+// stream capture modes (graph capture of the token path, ik2_main)
+#define cudaStreamCaptureModeGlobal hipStreamCaptureModeGlobal
+#define cudaStreamCaptureModeThreadLocal hipStreamCaptureModeThreadLocal
+#define cudaStreamCaptureModeRelaxed hipStreamCaptureModeRelaxed
+
 #include "intrinsics.hpp"

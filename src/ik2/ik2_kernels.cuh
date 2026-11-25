@@ -14,6 +14,11 @@
 
 namespace ik2::k {
 
+/// Paged global KV pool constants: 256 positions per page.
+constexpr int kKvPageShift = 8;
+constexpr int kKvPageSize = 1 << kKvPageShift;
+constexpr int kKvPageMask = kKvPageSize - 1;
+
 /// y = x * rsqrt(mean(x^2) + eps) * w per row of D (w null: no weight).  x and y may alias.
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s);
 /// rms of n <= 3 vectors [D] in one launch, each with its own weights: y[i] = rms(x[i]) * w[i] (y may be x).
@@ -90,13 +95,13 @@ void attn_probs_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk, int
 void attn_flash_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uint16_t* vc, int kv_cap, int H, int KV,
                     int D, int Tq, int qpos0, float qk_scale, const float* bias, int extent, int window,
                     const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats, int n_split,
-                    cudaStream_t s);
+                    cudaStream_t s, const int* page_table = nullptr);
 /// attn_flash_f16 over an FP8 (E4M3) cache: its tiles turned into FP16 as they are loaded; qk_scale with K's scale
 /// folded in, the output times v_inv_scale (as attn_decode_fp8).
 void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint8_t* vc, int kv_cap, int H, int KV,
                     int D, int Tq, int qpos0, float qk_scale, float v_inv_scale, const float* bias, int extent,
                     int window, const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats,
-                    int n_split, cudaStream_t s);
+                    int n_split, cudaStream_t s, const int* page_table = nullptr);
 /// a split count for attn_flash_f16: Tq queries x H heads against up to nk keys on n_sm SMs
 int attn_flash_splits(int Tq, int H, int nk, int n_sm);
 
@@ -247,12 +252,12 @@ void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const in
 void prep_qkv_r_f16(float* q, const float* q_clip, const float* k_in, uint16_t* kc, const float* v_in, uint16_t* vc,
                     float* r, const float* r_clip, int T, int H, int KV, int D, int d_rel, float qk_clip,
                     float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap,
-                    cudaStream_t s);
+                    cudaStream_t s, const int* page_table = nullptr);
 /// attn_decode for nq queries at positions qpos0 .. qpos0 + nq - 1 (q [nq][H][128], r [nq][H][d_rel], sink [nq][H],
 /// out [nq][H][128]), each over the keys k0 .. k0 + nk - 1 it may see.  scratch: nq x H x (nk + 128 x 130) floats.
 void attn_multi(const float* q, const float* r, const float* sink, const float* kc, const float* vc, int nq, int H,
                 int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj, int d_rel, int extent, int window,
-                float* scratch, float* out, cudaStream_t s);
+                float* scratch, float* out, cudaStream_t s, const int* page_table = nullptr);
 
 /// One query's attention (a token being generated), every head in one launch: q [H][D] and r [H][d_rel] as the
 /// clips left them, sink [H]; the keys at positions k0 .. k0 + nk - 1 of the caches kc / vc ([ctx][Hkv][D] F32), the
@@ -261,32 +266,34 @@ void attn_multi(const float* q, const float* r, const float* sink, const float* 
 /// combined after).  D = 128.
 void attn_decode(const float* q, const float* r, const float* sink, const float* kc, const float* vc, int H, int Hkv,
                  int D, int k0, int nk, int qpos, float qk_scale, const float* proj, int d_rel, int extent, int window,
-                 float* scratch, float* out, cudaStream_t s);
+                 float* scratch, float* out, cudaStream_t s, const int* page_table = nullptr);
 
 /// FP16 K / V cache variants of attn_multi / attn_decode with optional ring-buffer wraparound (when kv_cap > 0, key
 /// k0 + j sits at slot (k0 + j) % kv_cap; when kv_cap <= 0, linear slot k0 + j).  D = 128.
 void attn_multi_f16(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                     int kv_cap, int nq, int H, int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj,
-                    int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s);
+                    int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s,
+                    const int* page_table = nullptr);
 void attn_decode_f16(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                      int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale, const float* proj,
                      int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s,
-                     const float* gate = nullptr, uint16_t* out16 = nullptr);
+                     const int* page_table = nullptr, const float* gate = nullptr, uint16_t* out16 = nullptr);
 
 /// FP8 (E4M3FN) K / V cache variants: scale K by k_scale and V by v_scale on write; fold 1/k_scale into qk_scale
 /// and pass v_inv_scale = 1/v_scale on read.  slot = kv_cap > 0 ? (pos0 + t) % kv_cap : (pos0 + t).  D = 128.
 void prep_qkv_r_fp8(float* q, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in, uint8_t* vc,
                     float* r, const float* r_clip, int T, int H, int KV, int D, int d_rel, float qk_clip,
                     float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap,
-                    float k_scale, float v_scale, cudaStream_t s);
+                    float k_scale, float v_scale, cudaStream_t s, const int* page_table = nullptr);
 void attn_multi_fp8(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                     int kv_cap, int nq, int H, int Hkv, int k0, int nk, int qpos0, float qk_scale,
                     float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
-                    float* out, cudaStream_t s);
+                    float* out, cudaStream_t s, const int* page_table = nullptr);
 void attn_decode_fp8(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                      int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale,
                      float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
-                     float* out, cudaStream_t s, const float* gate = nullptr, uint16_t* out16 = nullptr);
+                     float* out, cudaStream_t s, const int* page_table = nullptr, const float* gate = nullptr,
+                     uint16_t* out16 = nullptr);
 /// The split attention kernel the HIP build launches: -1 the build's default (the GQA split kernel where it takes
 /// the shape, else the scalar one, and IK2_ATTN_GQA=0 turns GQA off), 0 the scalar attn_split_kernel, 1 the GQA
 /// kernel (HIP only: the CUDA build has no GQA path and this is a no-op there).  The tests use it to compare the
@@ -297,11 +304,10 @@ void attn_gqa_mode(int mode);
 /// kernel, whose partials are the scalar path's bit for bit.  IK2_ATTN_2LVL / IK2_ATTN_2LVL_NK, IK2_ATTN_KF=2 the
 /// two-key group; the tests use this to compare the groupings on one input.
 void attn_2lvl_mode(bool on, int nk);
-
 /// Unwrap nk KV rows starting at k0 from FP8 ring buffer into contiguous FP16 [nk, KD] scaled by k_inv_scale / v_inv_scale.
 void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk, int KD,
                           float k_inv_scale, float v_inv_scale, uint16_t* k_out16, uint16_t* v_out16,
-                          cudaStream_t s);
+                          cudaStream_t s, const int* page_table = nullptr);
 
 // ---- the resident token path: every expert in VRAM (found on the device), the position read on the device, so a
 // token needs nothing from the host between its embedding and its logits and its launches replay as one CUDA graph
@@ -356,23 +362,24 @@ void prep_qkv_r_f16_at(float* q, const float* q_clip, const float* k_in, uint16_
                        float* r, const float* r_clip, int H, int KV, int D, int d_rel, float qk_clip, float rel_clip,
                        float eps, const int* pos, bool log_scale, float alpha, float n_floor, int kv_cap,
                        uint16_t* q16, cudaStream_t s, const uint16_t* sink_w = nullptr, const float* sink_x = nullptr,
-                       int sink_k = 0, float* sink_y = nullptr);
+                       int sink_k = 0, float* sink_y = nullptr, const int* page_table = nullptr);
 void prep_qkv_r_fp8_at(float* q, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in, uint8_t* vc,
                        float* r, const float* r_clip, int H, int KV, int D, int d_rel, float qk_clip, float rel_clip,
                        float eps, const int* pos, bool log_scale, float alpha, float n_floor, int kv_cap,
                        float k_scale, float v_scale, uint16_t* q16, cudaStream_t s,
                        const uint16_t* sink_w = nullptr, const float* sink_x = nullptr, int sink_k = 0,
-                       float* sink_y = nullptr);
+                       float* sink_y = nullptr, const int* page_table = nullptr);
 /// attn_decode_f16 / _fp8 of the token at position *pos (device): the keys it may see follow from the position and
 /// the window (1 << 30: every one), split P ways whatever their number (P fixed, so the launches do not change from
 /// a token to the next).  scratch: H x P x 130 floats.
 void attn_decode_f16_at(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                         int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, const float* proj,
-                        int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s);
+                        int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s,
+                        const int* page_table = nullptr);
 void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                         int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, float v_inv_scale,
                         const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
-                        cudaStream_t s);
+                        cudaStream_t s, const int* page_table = nullptr);
 
 /// One token's attention on the tensor cores - for long contexts, where the scalar attn_decode is bound by its
 /// arithmetic; this one reads at the memory's speed, an FP8 cache too.  q16 [H][128]: the clipped q in FP16;
@@ -387,11 +394,12 @@ size_t attn_decode_mma_scratch(int H, int n_split);
 void attn_decode_mma_f16(const uint16_t* q16, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                          int kv_cap, int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale,
                          const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
-                         const float* gate, uint16_t* out16, cudaStream_t s);
+                         const float* gate, uint16_t* out16, cudaStream_t s, const int* page_table = nullptr);
 void attn_decode_mma_fp8(const uint16_t* q16, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                          int kv_cap, int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale,
                          float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
-                         float* out, const float* gate, uint16_t* out16, cudaStream_t s);
+                         float* out, const float* gate, uint16_t* out16, cudaStream_t s,
+                         const int* page_table = nullptr);
 
 // ---- speculative decoding: the draft model's (Inkling 2's DSpark drafter, mtp.safetensors) and the rollback's
 
@@ -454,11 +462,13 @@ void decode_host(int type, const uint8_t* blocks, size_t n, float* out);
 void attn_block_f16(const uint16_t* q16, const float* r, int r_ld, const float* sink, const uint16_t* kc,
                     const uint16_t* vc, int kv_cap, int H, int Hkv, const int* pos, int T, int n_split, float qk_scale,
                     const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
-                    const float* gate, int gate_ld, uint16_t* out16, cudaStream_t s);
+                    const float* gate, int gate_ld, uint16_t* out16, cudaStream_t s,
+                    const int* page_table = nullptr);
 void attn_block_fp8(const uint16_t* q16, const float* r, int r_ld, const float* sink, const uint8_t* kc,
                     const uint8_t* vc, int kv_cap, int H, int Hkv, const int* pos, int T, int n_split, float qk_scale,
                     float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
-                    float* out, const float* gate, int gate_ld, uint16_t* out16, cudaStream_t s);
+                    float* out, const float* gate, int gate_ld, uint16_t* out16, cudaStream_t s,
+                    const int* page_table = nullptr);
 size_t attn_block_scratch(int H, int T, int n_split);
 /// conv4_res for T tokens with row strides (x, res, y); with rec_old [3][C] and rec_x [T][C] given, the history
 /// before and the inputs kept for rollback_block.
@@ -504,12 +514,13 @@ void prep_qkv_r_fp8_block(float* q, int q_ld, const float* q_clip, const float* 
                           uint8_t* vc, float* r, int r_ld, const float* r_clip, int T, int H, int KV, int D, int d_rel,
                           float qk_clip, float rel_clip, float eps, const int* pos, bool log_scale, float alpha,
                           float n_floor, int kv_cap, float k_scale, float v_scale, uint16_t* q16, cudaStream_t s,
-                          const uint16_t* sink_w, const float* sink_x, int sink_k, float* sink_y);
+                          const uint16_t* sink_w, const float* sink_x, int sink_k, float* sink_y,
+                          const int* page_table = nullptr);
 void prep_qkv_r_f16_block(float* q, int q_ld, const float* q_clip, const float* k_in, uint16_t* kc, const float* v_in,
                           uint16_t* vc, float* r, int r_ld, const float* r_clip, int T, int H, int KV, int D, int d_rel,
                           float qk_clip, float rel_clip, float eps, const int* pos, bool log_scale, float alpha,
                           float n_floor, int kv_cap, uint16_t* q16, cudaStream_t s, const uint16_t* sink_w,
-                          const float* sink_x, int sink_k, float* sink_y);
+                          const float* sink_x, int sink_k, float* sink_y, const int* page_table = nullptr);
 /// route() for a window, a block a token (the same picks and weights to the bit).
 void route_rows(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
                 cudaStream_t s);
@@ -522,5 +533,38 @@ void experts_block_down_q8(const uint8_t* const* blob, const int* n, const int* 
 /// attn_res_jobs for T tokens: job j's queries q + j nq C, its output out + j nq T C ([nq][T][C]).
 void attn_res_jobs_block(const ResStates& states, int n, const float* q, int nq, int jobs, int T, int C, float eps,
                          float* out, cudaStream_t s);
+
+// ---- multi-slot batched decode path (B concurrent independent requests, each on its own slot)
+
+/// Short conv for B independent requests: batch item b reads/updates hist_base + slot_ids[b] * 3 * C.
+void conv_slots(const float* x, int x_ld, float* hist_base, const int* slot_ids, const float* w, const float* dyn,
+                int d_ld, int heads, int B, int C, const float* res, int res_ld, float* y, int y_ld, cudaStream_t s);
+/// Attention-input prep for B independent requests at positions pos_d[b] on slots slot_ids[b].
+/// If page_tables != nullptr, writes into shared paged pool using page_tables + slot_ids[b] * pt_stride;
+/// otherwise writes into per-slot sliding ring kc_base + slot_ids[b] * kv_cap * KV * D.
+void prep_qkv_r_fp8_slots(float* q, int q_ld, const float* q_clip, const float* k_in, uint8_t* kc_base,
+                          const float* v_in, uint8_t* vc_base, float* r, int r_ld, const float* r_clip, int B, int H,
+                          int KV, int D, int d_rel, float qk_clip, float rel_clip, float eps, const int* pos_d,
+                          const int* slot_ids, const int* page_tables, int pt_stride, bool log_scale, float alpha,
+                          float n_floor, int kv_cap, float k_scale, float v_scale, uint16_t* q16, cudaStream_t s,
+                          const uint16_t* sink_w, const float* sink_x, int sink_k, float* sink_y);
+void prep_qkv_r_f16_slots(float* q, int q_ld, const float* q_clip, const float* k_in, uint16_t* kc_base,
+                          const float* v_in, uint16_t* vc_base, float* r, int r_ld, const float* r_clip, int B, int H,
+                          int KV, int D, int d_rel, float qk_clip, float rel_clip, float eps, const int* pos_d,
+                          const int* slot_ids, const int* page_tables, int pt_stride, bool log_scale, float alpha,
+                          float n_floor, int kv_cap, uint16_t* q16, cudaStream_t s, const uint16_t* sink_w,
+                          const float* sink_x, int sink_k, float* sink_y);
+/// Batched decode attention over B independent slots on the tensor cores.
+size_t attn_slots_scratch(int H, int B, int n_split);
+void attn_slots_fp8(const uint16_t* q16, const float* r, int r_ld, const float* sink, const uint8_t* kc_base,
+                    const uint8_t* vc_base, int kv_cap, int H, int Hkv, const int* pos_d, const int* slot_ids,
+                    const int* page_tables, int pt_stride, int B, int n_split, float qk_scale, float v_inv_scale,
+                    const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
+                    const float* gate, int gate_ld, uint16_t* out16, cudaStream_t s);
+void attn_slots_f16(const uint16_t* q16, const float* r, int r_ld, const float* sink, const uint16_t* kc_base,
+                    const uint16_t* vc_base, int kv_cap, int H, int Hkv, const int* pos_d, const int* slot_ids,
+                    const int* page_tables, int pt_stride, int B, int n_split, float qk_scale, const float* proj,
+                    int d_rel, int extent, int window, float* scratch, float* out, const float* gate, int gate_ld,
+                    uint16_t* out16, cudaStream_t s);
 
 }  // namespace ik2::k

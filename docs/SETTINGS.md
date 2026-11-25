@@ -2679,7 +2679,7 @@ tokenizer folder and the run config, then `python serve/server.py --engine maya 
 (0.9 - "high"). The template is thinkingmachines' (`tools/ik2/chat_template.jinja`), which takes every level by name:
 none, low (0.2), medium (0.7), high (0.9), xhigh and max (0.99); Off is none.
 
-Engine flags: `--max-context N` (262144), `--cache-gb N` (60: the expert cache's most, less if VRAM is short),
+Engine flags: `--max-context N` (262144), `--parallel N` (1: up to 8 concurrent requests in `--serve`, single GPU, non-managed KV; global KV is shared in 256-token pages across slots while each slot keeps its own sliding-window ring), `--cache-gb N` (60: the expert cache's most, less if VRAM is short),
 `--gpus 1|2`, `--threads N` (8: the loading and the CPU lane), `--eos a,b`. Environment:
 
 | Variable | Default | What it does |
@@ -2707,7 +2707,10 @@ Engine flags: `--max-context N` (262144), `--cache-gb N` (60: the expert cache's
 | `IK2_DRAFT_WIDTH` | `5` | `--draft` on Inkling-2-Mini's resident path: the widest window a step verifies (the anchor and its drafts, 2 .. 8) |
 | `IK2_DRAFT_ADAPT`, `IK2_DRAFT_PROBE`, `IK2_DRAFT_DECAY` | `1`, `8`, `0.85` | the controller: a window only when its expected tokens over its measured time beat a plain token's; after `PROBE` plain tokens one window to look at the acceptance again; `DECAY` how fast the acceptance is forgotten. `IK2_DRAFT_ADAPT=0`: always `IK2_DRAFT_WIDTH` wide |
 | `IK2_DRAFT_CTX` | the context | the positions the drafter's layer without a window sees (the last ones; its cache FP16, 4 KB a position): `65536` keeps 262144 resident on a 24 GB card |
+| `IK2_SLOT_KEEP` | `8` | `--serve` (one request at a time): a conversation another request would throw away (an agent's side call: a summary, a sub-task, a picture's description) is kept in host RAM first - the full layers' KV before its last prompt's end, that point's conv histories and sliding windows, the drafter's context - and a later request that goes on from it gets it back in a copy instead of reading its prompt again (one RTX 4090, Inkling-2-Mini with the drafter: 54.5k tokens are 1.15 GiB, parked in 0.1-0.4 s and back in 0.07 s against 12 s read again; the answers the same). Conversations of 2048 tokens or more; at most this many, the least recently used given up first. `0`: off |
+| `IK2_SLOT_RAM_GB` | half the free RAM | the most `IK2_SLOT_KEEP` holds, GiB. Unset: half of the RAM free (Windows: and commit) over a 4 GiB reserve, counting what is held |
 | `IK2_BLOCK`, `IK2_BLOCK_CHECK` | `1`, `0` | `0`: a verify window through forward() instead of the block path; `n`: the first n windows through both, their logits compared |
+| `IK2_SLOTS_CHECK` | `0` | with `--parallel` > 1 on the resident path, run the first `n` batched decode steps through both `fast_slots()` and solo `forward()` on identical state and log max `|dlogit|`, per-row KL, and argmax differences to stderr |
 | `IK2_RG_SLOTS` | 96 tokens' picks | with every expert in VRAM, a prompt of up to this many slots (tokens x picks) has its experts read by groups - an expert's blocks once for up to 8 of its tokens - instead of decoded to FP16 for a GEMM (a chat turn of 12 new tokens 118 -> 56 ms). `0`: never |
 | `IK2_CAND` | on | sampling takes the largest logits found on the device (a thousand and a few more) instead of the vocabulary's logits every token (100 -> 110 tok/s at temperature 1; the same tokens for the same seed). `0`: the logits |
 | `IK2_FLASH`, `IK2_MV`, `IK2_GROUP`, `IK2_OVERLAP`, `IK2_PREFETCH`, `IK2_SCAN`, `IK2_RELB`, `IK2_BORROW` | on | A/B switches (`0`): the paths these replaced - the attention through logits in memory, few tokens' experts through the GEMMs, no grouping, copies on the compute stream, no prefetch, plain LRU in prompt passes, no relative-bias table, no scratch lent from the cache for long prompts |

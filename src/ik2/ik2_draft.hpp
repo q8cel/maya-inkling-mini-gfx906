@@ -47,5 +47,10 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
 void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d);
 /// VRAM it holds, bytes.
 size_t bytes(const Drafter* d);
+/// A conversation of P positions kept in host RAM and brought back (the serve loop's IK2_SLOT_KEEP): the bytes of its
+/// context caches (each layer's slots 0 .. min(P, cap) - 1, and f_rnn), and their copy out to / back from `host`.
+size_t context_bytes(const Drafter* d, int P);
+void save_context(Drafter* d, int P, uint8_t* out);
+void load_context(Drafter* d, int P, const uint8_t* in);
 
 }  // namespace ik2::draft

@@ -4,6 +4,9 @@
 // This header is included only from the HIP cuda_runtime compatibility shim.
 #if defined(__HIPCC__)
 #include <hip/hip_version.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp8.h>
 
 #include <cstdint>
 

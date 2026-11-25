@@ -2453,9 +2453,9 @@ void test_drafter_ops() {
                     want[b + i] = a * cs - bb * sn;
                     want[b + i + 64] = bb * cs + a * sn;
                 }
-        // (a float angle at 65535 rad quantises to 2^-8: sin there is good to ~4e-3 against a double angle; a
-        //  wrong pairing, theta or stride is off by O(0.1))
-        expect("rope_neox (theta 1e6, 9 positions)", got, want, 1e-5, 5e-3);
+        // (a float angle at 65535 rad quantises to 2^-8 and sincosf then reduces it in float: the rotation is
+        //  good to ~1e-2 against the same float angle in double; a wrong pairing, theta or stride is off by O(0.1))
+        expect("rope_neox (theta 1e6, 9 positions)", got, want, 1e-5, 1e-2);
         cudaFree(dx), cudaFree(dp);
     }
     // 4. rnn_inputs: the 5120-wide Markov cell's input - state | bf16(w1[prev]) | h | f_rnn, bf16 each
@@ -3097,6 +3097,239 @@ void test_q8_verify_tile() {
 }
 #endif  // !defined(STRATA_USE_HIP)   (test_experts_mma and test_q8_verify_tile launch mma.sync kernels, CUDA only)
 
+void test_conv_slots() {
+    const int n_slots = 6, B = 4, C = 1024, heads = 8;
+    const int x_ld = C + 32, res_ld = C + 16, y_ld = C + 24, d_ld = heads * 4 + 8;
+    const std::vector<int> sids = {4, 1, 5, 0};
+    int* dsids = dev(sids);
+    auto w = fvec((size_t) C * 4);
+    float* dw = dev(w);
+    for (int with_dyn = 0; with_dyn < 2; ++with_dyn)
+        for (int with_res = 0; with_res < 2; ++with_res) {
+            float* dhist_bat = dev_n<float>((size_t) n_slots * 3 * C);
+            std::vector<float*> dhist_ref(B);
+            for (int b = 0; b < B; ++b) dhist_ref[b] = dev_n<float>((size_t) 3 * C);
+            float *dy_bat = dev_n<float>((size_t) B * y_ld), *dy_ref = dev_n<float>((size_t) C);
+            for (int step = 0; step < 5; ++step) {
+                auto x = fvec((size_t) B * x_ld), res = fvec((size_t) B * res_ld), dyn = fvec((size_t) B * d_ld);
+                float *dx = dev(x), *dres = dev(res), *dd = dev(dyn);
+                k::conv_slots(dx, x_ld, dhist_bat, dsids, dw, with_dyn ? dd : nullptr, d_ld, heads, B, C,
+                              with_res ? dres : nullptr, res_ld, dy_bat, y_ld, 0);
+                CU(cudaDeviceSynchronize());
+                auto got_all = host(dy_bat, (size_t) B * y_ld);
+                for (int b = 0; b < B; ++b) {
+                    k::conv4_res(dx + (size_t) b * x_ld, dhist_ref[b], dw,
+                                 with_dyn ? dd + (size_t) b * d_ld : nullptr, heads, 1, C,
+                                 with_res ? dres + (size_t) b * res_ld : nullptr, dy_ref, 0);
+                    CU(cudaDeviceSynchronize());
+                    auto ref = host(dy_ref, (size_t) C);
+                    std::vector<float> got(got_all.begin() + (size_t) b * y_ld,
+                                           got_all.begin() + (size_t) b * y_ld + C);
+                    std::vector<double> want(ref.begin(), ref.end());
+                    char name[96];
+                    std::snprintf(name, sizeof name, "conv_slots dyn=%d res=%d step=%d b=%d", with_dyn, with_res, step,
+                                  b);
+                    expect(name, got, want, 1e-5);
+                }
+                cudaFree(dx), cudaFree(dres), cudaFree(dd);
+            }
+            // Verify per-slot histories match reference and untouched slots remain zero
+            auto hist_all = host(dhist_bat, (size_t) n_slots * 3 * C);
+            for (int b = 0; b < B; ++b) {
+                auto ref_h = host(dhist_ref[b], (size_t) 3 * C);
+                std::vector<float> got_h(hist_all.begin() + (size_t) sids[b] * 3 * C,
+                                         hist_all.begin() + (size_t) (sids[b] + 1) * 3 * C);
+                std::vector<double> want_h(ref_h.begin(), ref_h.end());
+                char name[96];
+                std::snprintf(name, sizeof name, "conv_slots hist dyn=%d res=%d b=%d", with_dyn, with_res, b);
+                expect(name, got_h, want_h, 1e-5);
+            }
+            for (int s : {2, 3}) {
+                std::vector<float> got_z(hist_all.begin() + (size_t) s * 3 * C,
+                                         hist_all.begin() + (size_t) (s + 1) * 3 * C);
+                std::vector<double> want_z((size_t) 3 * C, 0.0);
+                char name[96];
+                std::snprintf(name, sizeof name, "conv_slots untouched slot=%d dyn=%d res=%d", s, with_dyn, with_res);
+                expect(name, got_z, want_z, 0.0);
+            }
+            cudaFree(dhist_bat), cudaFree(dy_bat), cudaFree(dy_ref);
+            for (int b = 0; b < B; ++b) cudaFree(dhist_ref[b]);
+        }
+    cudaFree(dw), cudaFree(dsids);
+}
+
+void test_attn_slots() {
+    const int n_slots = 4, B = 4, H = 24, KV = 8, D = 128, d_rel = 16, extent = 1024, sink_k = 64;
+    const int HD = H * D, KD = KV * D, HR = H * d_rel;
+    const int q_ld = HD + 64, r_ld = HR + 32, gate_ld = HD + 64;
+    const std::vector<int> sids = {2, 0, 3, 1};
+    const std::vector<int> poss = {0, 15, 300, 1400};
+    const float eps = 1e-6f, qk_clip = 24.0f, rel_clip = 8.0f, alpha = 0.06f, n_floor = 16.0f;
+    const float qk_scale = 1.0f / std::sqrt((float) D);
+    const int n_split = 4;
+
+    int *dsids = dev(sids), *dpos = dev(poss);
+    auto q_clip = fvec((size_t) H, 1.5f), r_clip = fvec((size_t) H, 1.5f);
+    for (float& v : q_clip) v = std::fabs(v) + 0.5f;
+    for (float& v : r_clip) v = std::fabs(v) + 0.5f;
+    auto proj = fvec((size_t) extent * d_rel);
+    auto sink_wf = fvec((size_t) H * sink_k);
+    std::vector<uint16_t> sink_w(sink_wf.size());
+    for (size_t i = 0; i < sink_wf.size(); ++i) sink_w[i] = f2h_host(sink_wf[i]);
+    auto sink_x = fvec((size_t) B * sink_k);
+    auto gate = fvec((size_t) B * gate_ld, 2.0f);
+
+    float *dqc = dev(q_clip), *drc = dev(r_clip), *dp = dev(proj), *dsx = dev(sink_x), *dgate = dev(gate);
+    uint16_t* dsw = dev(sink_w);
+
+    for (int fp8 = 0; fp8 < 2; ++fp8)
+        for (int paged = 0; paged < 2; ++paged) {
+            const float k_scale = fp8 ? 16.0f : 1.0f, v_scale = fp8 ? 32.0f : 1.0f;
+            const int window = paged ? (1 << 30) : 1024;
+            const int kv_cap = paged ? 0 : 1056;
+            const bool log_scale = paged != 0;
+            const int pt_stride = 8;
+            // Shuffled non-contiguous physical page table (4 slots x 8 pages = 32 physical pages)
+            std::vector<int> pt_h((size_t) n_slots * pt_stride, 0);
+            int total_pages = n_slots * pt_stride;
+            for (int s = 0; s < n_slots; ++s)
+                for (int lp = 0; lp < pt_stride; ++lp)
+                    pt_h[(size_t) s * pt_stride + lp] = (lp * n_slots + ((s * 3 + 1) % n_slots)) % total_pages;
+            int* dpt = paged ? dev(pt_h) : nullptr;
+            const size_t pool_rows = paged ? (size_t) total_pages * k::kKvPageSize : (size_t) n_slots * kv_cap;
+
+            // Populate prior KV positions [0 .. poss[b] - 1] in each slot's backing storage
+            std::vector<uint16_t> k16_init, v16_init;
+            std::vector<uint8_t> k8_init, v8_init;
+            if (fp8) {
+                k8_init.assign(pool_rows * KD, 0x7e);
+                v8_init.assign(pool_rows * KD, 0x7e);
+            } else {
+                k16_init.assign(pool_rows * KD, 0x7e00);
+                v16_init.assign(pool_rows * KD, 0x7e00);
+            }
+            for (int b = 0; b < B; ++b) {
+                const int s = sids[b];
+                const int lo = paged ? 0 : std::max(0, poss[b] - window + 1);
+                for (int pos = lo; pos < poss[b]; ++pos) {
+                    const size_t phys =
+                        paged ? (size_t) pt_h[(size_t) s * pt_stride + (pos >> k::kKvPageShift)] * k::kKvPageSize +
+                                    (pos & k::kKvPageMask)
+                              : (size_t) s * kv_cap + (pos % kv_cap);
+                    for (int x = 0; x < KD; ++x) {
+                        if (fp8) {
+                            uint8_t bk = (uint8_t) (rng() & 0xFFu), bv = (uint8_t) (rng() & 0xFFu);
+                            if ((bk & 0x7F) >= 0x60) bk &= 0xDFu;
+                            if ((bv & 0x7F) >= 0x60) bv &= 0xDFu;
+                            k8_init[phys * KD + x] = bk;
+                            v8_init[phys * KD + x] = bv;
+                        } else {
+                            k16_init[phys * KD + x] = f2h_host(frand(1.0f));
+                            v16_init[phys * KD + x] = f2h_host(frand(1.0f));
+                        }
+                    }
+                }
+            }
+
+            auto q_in = fvec((size_t) B * q_ld, 2.0f);
+            auto r_in = fvec((size_t) B * r_ld, 2.0f);
+            auto k_in = fvec((size_t) B * KD, 1.5f);
+            auto v_in = fvec((size_t) B * KD, 1.5f);
+
+            // Batched multi-slot buffers
+            float *dq_b = dev(q_in), *dr_b = dev(r_in), *dk_in = dev(k_in), *dv_in = dev(v_in);
+            float *dsy_b = dev_n<float>((size_t) B * H), *dout_b = dev_n<float>((size_t) B * HD);
+            uint16_t *dq16_b = dev_n<uint16_t>((size_t) B * HD), *dout16_b = dev_n<uint16_t>((size_t) B * HD);
+            float* dscr_b = dev_n<float>(k::attn_slots_scratch(H, B, n_split));
+
+            // Independent single-slot reference buffers
+            float *dq_r = dev(q_in), *dr_r = dev(r_in);
+            float *dsy_r = dev_n<float>((size_t) B * H), *dout_r = dev_n<float>((size_t) B * HD);
+            uint16_t *dq16_r = dev_n<uint16_t>((size_t) B * HD), *dout16_r = dev_n<uint16_t>((size_t) B * HD);
+            float* dscr_r = dev_n<float>(k::attn_decode_mma_scratch(H, n_split));
+
+            if (fp8) {
+                uint8_t *dkc_b = dev(k8_init), *dvc_b = dev(v8_init);
+                uint8_t *dkc_r = dev(k8_init), *dvc_r = dev(v8_init);
+                k::prep_qkv_r_fp8_slots(dq_b, q_ld, dqc, dk_in, dkc_b, dv_in, dvc_b, dr_b, r_ld, drc, B, H, KV, D,
+                                        d_rel, qk_clip, rel_clip, eps, dpos, dsids, dpt, pt_stride, log_scale, alpha,
+                                        n_floor, kv_cap, k_scale, v_scale, dq16_b, 0, dsw, dsx, sink_k, dsy_b);
+                k::attn_slots_fp8(dq16_b, dr_b, r_ld, dsy_b, dkc_b, dvc_b, kv_cap, H, KV, dpos, dsids, dpt, pt_stride,
+                                  B, n_split, qk_scale / k_scale, 1.0f / v_scale, dp, d_rel, extent, window, dscr_b,
+                                  dout_b, dgate, gate_ld, dout16_b, 0);
+                for (int b = 0; b < B; ++b) {
+                    const int s = sids[b];
+                    uint8_t* kc_s = paged ? dkc_r : dkc_r + (size_t) s * kv_cap * KD;
+                    uint8_t* vc_s = paged ? dvc_r : dvc_r + (size_t) s * kv_cap * KD;
+                    const int* pt_s = paged ? dpt + (size_t) s * pt_stride : nullptr;
+                    k::prep_qkv_r_fp8_at(dq_r + (size_t) b * q_ld, dqc, dk_in + (size_t) b * KD, kc_s,
+                                         dv_in + (size_t) b * KD, vc_s, dr_r + (size_t) b * r_ld, drc, H, KV, D, d_rel,
+                                         qk_clip, rel_clip, eps, dpos + b, log_scale, alpha, n_floor, kv_cap, k_scale,
+                                         v_scale, dq16_r + (size_t) b * HD, 0, dsw, dsx + (size_t) b * sink_k, sink_k,
+                                         dsy_r + (size_t) b * H, pt_s);
+                    k::attn_decode_mma_fp8(dq16_r + (size_t) b * HD, dr_r + (size_t) b * r_ld, dsy_r + (size_t) b * H,
+                                           kc_s, vc_s, kv_cap, H, KV, dpos + b, -1, n_split, qk_scale / k_scale,
+                                           1.0f / v_scale, dp, d_rel, extent, window, dscr_r, dout_r + (size_t) b * HD,
+                                           dgate + (size_t) b * gate_ld, dout16_r + (size_t) b * HD, 0, pt_s);
+                }
+                CU(cudaDeviceSynchronize());
+                cudaFree(dkc_b), cudaFree(dvc_b), cudaFree(dkc_r), cudaFree(dvc_r);
+            } else {
+                uint16_t *dkc_b = dev(k16_init), *dvc_b = dev(v16_init);
+                uint16_t *dkc_r = dev(k16_init), *dvc_r = dev(v16_init);
+                k::prep_qkv_r_f16_slots(dq_b, q_ld, dqc, dk_in, dkc_b, dv_in, dvc_b, dr_b, r_ld, drc, B, H, KV, D,
+                                        d_rel, qk_clip, rel_clip, eps, dpos, dsids, dpt, pt_stride, log_scale, alpha,
+                                        n_floor, kv_cap, dq16_b, 0, dsw, dsx, sink_k, dsy_b);
+                k::attn_slots_f16(dq16_b, dr_b, r_ld, dsy_b, dkc_b, dvc_b, kv_cap, H, KV, dpos, dsids, dpt, pt_stride,
+                                  B, n_split, qk_scale, dp, d_rel, extent, window, dscr_b, dout_b, dgate, gate_ld,
+                                  dout16_b, 0);
+                for (int b = 0; b < B; ++b) {
+                    const int s = sids[b];
+                    uint16_t* kc_s = paged ? dkc_r : dkc_r + (size_t) s * kv_cap * KD;
+                    uint16_t* vc_s = paged ? dvc_r : dvc_r + (size_t) s * kv_cap * KD;
+                    const int* pt_s = paged ? dpt + (size_t) s * pt_stride : nullptr;
+                    k::prep_qkv_r_f16_at(dq_r + (size_t) b * q_ld, dqc, dk_in + (size_t) b * KD, kc_s,
+                                         dv_in + (size_t) b * KD, vc_s, dr_r + (size_t) b * r_ld, drc, H, KV, D, d_rel,
+                                         qk_clip, rel_clip, eps, dpos + b, log_scale, alpha, n_floor, kv_cap,
+                                         dq16_r + (size_t) b * HD, 0, dsw, dsx + (size_t) b * sink_k, sink_k,
+                                         dsy_r + (size_t) b * H, pt_s);
+                    k::attn_decode_mma_f16(dq16_r + (size_t) b * HD, dr_r + (size_t) b * r_ld, dsy_r + (size_t) b * H,
+                                           kc_s, vc_s, kv_cap, H, KV, dpos + b, -1, n_split, qk_scale, dp, d_rel,
+                                           extent, window, dscr_r, dout_r + (size_t) b * HD,
+                                           dgate + (size_t) b * gate_ld, dout16_r + (size_t) b * HD, 0, pt_s);
+                }
+                CU(cudaDeviceSynchronize());
+                cudaFree(dkc_b), cudaFree(dvc_b), cudaFree(dkc_r), cudaFree(dvc_r);
+            }
+
+            auto sy_got = host(dsy_b, (size_t) B * H), sy_ref = host(dsy_r, (size_t) B * H);
+            auto out_got = host(dout_b, (size_t) B * HD), out_ref = host(dout_r, (size_t) B * HD);
+            auto out16_got = host(dout16_b, (size_t) B * HD), out16_ref = host(dout16_r, (size_t) B * HD);
+            std::vector<double> sy_w(sy_ref.begin(), sy_ref.end()), out_w(out_ref.begin(), out_ref.end());
+            std::vector<float> o16_g(out16_got.size());
+            std::vector<double> o16_w(out16_ref.size());
+            for (size_t i = 0; i < out16_got.size(); ++i)
+                o16_g[i] = h2f_host(out16_got[i]), o16_w[i] = h2f_host(out16_ref[i]);
+            char name[96];
+            std::snprintf(name, sizeof name, "prep_qkv_r_%s_slots %s sink", fp8 ? "fp8" : "f16",
+                          paged ? "paged" : "ring");
+            expect(name, sy_got, sy_w, 1e-5);
+            std::snprintf(name, sizeof name, "attn_slots_%s %s out", fp8 ? "fp8" : "f16", paged ? "paged" : "ring");
+            expect(name, out_got, out_w, 1e-5);
+            std::snprintf(name, sizeof name, "attn_slots_%s %s out16", fp8 ? "fp8" : "f16", paged ? "paged" : "ring");
+            expect(name, o16_g, o16_w, 1e-5);
+
+            if (dpt) cudaFree(dpt);
+            cudaFree(dq_b), cudaFree(dr_b), cudaFree(dk_in), cudaFree(dv_in);
+            cudaFree(dsy_b), cudaFree(dout_b), cudaFree(dq16_b), cudaFree(dout16_b), cudaFree(dscr_b);
+            cudaFree(dq_r), cudaFree(dr_r), cudaFree(dsy_r), cudaFree(dout_r), cudaFree(dq16_r), cudaFree(dout16_r),
+                cudaFree(dscr_r);
+        }
+
+    cudaFree(dsids), cudaFree(dpos), cudaFree(dqc), cudaFree(drc), cudaFree(dp), cudaFree(dsx), cudaFree(dgate),
+        cudaFree(dsw);
+}
+
 int main() {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
@@ -3140,8 +3373,11 @@ int main() {
 #endif
     test_attn_gqa();   // (last: its random K / V leaves the others' data as it was)
     test_attn_two_level();
-    test_attn_two_level();
     test_drafter_ops();
+#if !defined(STRATA_USE_HIP)
+    test_conv_slots();
+    test_attn_slots();
+#endif
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
