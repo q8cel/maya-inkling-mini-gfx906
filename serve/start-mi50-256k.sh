@@ -27,6 +27,7 @@ CONTEXT=${CONTEXT:-262144}
 PORT=${PORT:-18000}
 HOST=${HOST:-0.0.0.0}
 CACHE_GB=${CACHE_GB:-14}
+API_KEY_FILE=${API_KEY_FILE:-$HOME/certs/api-key}
 
 export HIP_VISIBLE_DEVICES=0,1
 export HSA_FORCE_FINE_GRAIN_PCIE=1
@@ -48,5 +49,12 @@ if [ "$CONTEXT" != 262144 ] || [ "$CACHE_GB" != 14 ]; then
     | .args[$i + 1] = $c | .args[$j + 1] = $g' docs/inkling2-mini/ik2-mini-hip-256k.json > "$CFG"
 fi
 
-exec ~/.venv/bin/python serve/server.py --engine maya --config "$CFG" \
-  --host "$HOST" --port "$PORT"
+set -- --engine maya --config "$CFG" --host "$HOST" --port "$PORT"
+if [ -n "$API_KEY_FILE" ] && [ -f "$API_KEY_FILE" ]; then
+  # (passed as one argument; the file is read here at start, never printed)
+  set -- "$@" --api-key "$(cat "$API_KEY_FILE")"
+  echo "serve: API key on (/v1 needs it)"
+else
+  echo "serve: no API key file at ${API_KEY_FILE:-<unset>} - /v1 is open" >&2
+fi
+exec ~/.venv/bin/python serve/server.py "$@"
