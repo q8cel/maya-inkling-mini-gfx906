@@ -616,7 +616,10 @@ the change (`5608e98aa117` twelve times, 47.90 - 48.99 tok/s, tests 357 checks 0
   accepted: the README's shell tail gives 48.8 tok/s against 42.7 plain at width 5, while prose and C++ source are at
   or below plain decoding (255 ids: 42.6 tok/s at width 3 against 43.9). Off by default, and `--serve` has no spec
   path for it (its `spec_step` is the block path's, which this build does not have).
-* **Vision**: the mmproj file exists but the vision encoder is not built for HIP here.
+* **Vision**: the encoder runs on the CPU. Build `maya-vision` from llama.cpp b12590
+  (`cmake -S tools/vision -B build-vision -DLLAMA_DIR=third_party/llama.cpp`) and point the config's
+  `"vision"` entry at `/disk/models/mmproj-BF16.gguf`; `serve/start-mi50-256k.sh` does this. The HIP
+  GPU build of the encoder (`-DSTRATA_VISION_HIP=ON`) is not used on gfx906.
 
 ## Cold start
 
